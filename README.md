@@ -90,6 +90,9 @@ This creates a sample configuration file at:
 {
   "drive_label": "OM SYSTEM",
   "raw_extensions": [".ORF"],
+  "convert_to_dng": false,
+  "dng_converter_path": "",
+  "cleanup_dng_files": true,
   "rawtherapee_executable": "",
   "pp3_profile_path": "/path/to/your/profile.pp3",
   "jpeg_quality": 92,
@@ -114,6 +117,12 @@ This creates a sample configuration file at:
 |--------|-------------|---------|
 | `drive_label` | Volume label of your camera card | `OM SYSTEM` |
 | `raw_extensions` | Array of RAW file extensions to process | `[".ORF"]` |
+| `convert_to_dng` | Convert RAW to DNG before RawTherapee (for unsupported cameras) | `false` |
+| `dng_converter_path` | Path to Adobe DNG Converter (auto-detected if empty) | Auto |
+| `dng_output_directory` | Directory for intermediate DNG files | Temp dir |
+| `dng_compressed` | Use compressed DNG format (smaller files) | `false` |
+| `dng_embed_original` | Embed original RAW in DNG (larger files) | `false` |
+| `cleanup_dng_files` | Delete intermediate DNG files after processing | `true` |
 | `rawtherapee_executable` | Path to rawtherapee-cli (auto-detected if empty) | Auto |
 | `pp3_profile_path` | Path to your PP3 processing profile | Required (if processing RAW) |
 | `jpeg_quality` | Output JPEG quality (1-100) | `92` |
@@ -171,6 +180,38 @@ This creates a sample configuration file at:
   "raw_extensions": [".ORF", ".CR2", ".NEF", ".ARW", ".RAF", ".DNG"]
 }
 ```
+
+### DNG Conversion for Unsupported Cameras
+
+Some newer cameras (like the OM System OM-3) may not be natively supported by RawTherapee yet. In this case, you can use Adobe DNG Converter to convert the RAW files to DNG format before processing with RawTherapee.
+
+**Requirements:**
+- [Adobe DNG Converter](https://www.adobe.com/support/downloads/dng/dng_converter.html) (free download from Adobe)
+  - Windows: `C:\Program Files\Adobe\Adobe DNG Converter\Adobe DNG Converter.exe`
+  - macOS: `/Applications/Adobe DNG Converter.app`
+
+**Configuration for OM System OM-3 (or other unsupported cameras):**
+```json
+{
+  "drive_label": "OM SYSTEM",
+  "raw_extensions": [".ORF"],
+  "convert_to_dng": true,
+  "cleanup_dng_files": true,
+  "pp3_profile_path": "C:/Users/YourName/AppData/Local/RawTherapee/profiles/OM3_Default_DNG.pp3"
+}
+```
+
+**How it works:**
+1. RAW files (e.g., `.ORF`) are scanned from the camera card
+2. Each RAW file is converted to DNG using Adobe DNG Converter
+3. The DNG file is processed with RawTherapee using your PP3 profile
+4. The resulting JPEG is uploaded to Immich
+5. Intermediate DNG files are cleaned up (if `cleanup_dng_files` is enabled)
+
+**PP3 Profile Notes:**
+- When using DNG conversion, you may need to create a separate PP3 profile for DNG files
+- The DNG file may have slightly different characteristics than the original RAW
+- Test with a few files first to ensure your profile produces the desired results
 
 ## Usage
 

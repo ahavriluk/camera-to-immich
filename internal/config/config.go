@@ -16,6 +16,14 @@ type Config struct {
 	// File settings
 	RawExtensions []string `json:"raw_extensions"` // RAW file extensions to process (e.g., [".ORF", ".CR2", ".NEF", ".ARW"])
 
+	// DNG Conversion settings (for cameras not natively supported by RawTherapee)
+	ConvertToDNG         bool   `json:"convert_to_dng"`          // Convert RAW to DNG before RawTherapee processing
+	DNGConverterPath     string `json:"dng_converter_path"`      // Path to Adobe DNG Converter (auto-detected if empty)
+	DNGOutputDirectory   string `json:"dng_output_directory"`    // Directory for intermediate DNG files (temp dir if empty)
+	DNGCompressed        bool   `json:"dng_compressed"`          // Use compressed DNG format (smaller files)
+	DNGEmbedOriginal     bool   `json:"dng_embed_original"`      // Embed original raw in DNG (larger files)
+	CleanupDNGFiles      bool   `json:"cleanup_dng_files"`       // Delete intermediate DNG files after processing
+
 	// RawTherapee settings
 	RawTherapeeExecutable string `json:"rawtherapee_executable"` // Path to rawtherapee-cli
 	PP3ProfilePath        string `json:"pp3_profile_path"`       // Path to the PP3 profile
@@ -47,6 +55,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		DriveLabel:          "OM SYSTEM",
 		RawExtensions:       []string{".ORF"}, // Olympus RAW format by default
+		ConvertToDNG:        false,            // Disabled by default
+		CleanupDNGFiles:     true,             // Clean up intermediate DNG files
 		JPEGQuality:         92,
 		OutputDirectory:     filepath.Join(homeDir, ".camera-to-immich", "output"),
 		ProcessRAWFiles:     true,
@@ -151,6 +161,9 @@ func CreateSampleConfig(configPath string) error {
 	config.ImmichAlbum = "Camera Uploads"
 	config.ImmichTags = []string{"camera", "photography"}
 	config.ProcessRAWFiles = true
+	// DNG conversion settings (for unsupported cameras like OM-3)
+	config.ConvertToDNG = false // Set to true if your camera isn't supported by RawTherapee
+	config.CleanupDNGFiles = true
 
 	return config.Save(configPath)
 }

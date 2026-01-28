@@ -341,6 +341,47 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 		return nil
 	}
 
+	// Initialize DNG converter if enabled (for cameras not natively supported by RawTherapee)
+	var dngConverter *processor.DNGConverter
+	var dngOutputDir string
+	var dngFilesToCleanup []string
+	
+	if cfg.ConvertToDNG {
+		logStep("Initializing Adobe DNG Converter...")
+		
+		// Use temp directory for DNG files if not specified
+		dngOutputDir = cfg.DNGOutputDirectory
+		if dngOutputDir == "" {
+			var err error
+			dngOutputDir, err = os.MkdirTemp("", "camera-to-immich-dng-*")
+			if err != nil {
+				return fmt.Errorf("failed to create temp directory for DNG files: %v", err)
+			}
+			// Clean up temp directory on exit
+			defer os.RemoveAll(dngOutputDir)
+		} else {
+			// Ensure directory exists
+			if err := os.MkdirAll(dngOutputDir, 0755); err != nil {
+				return fmt.Errorf("failed to create DNG output directory: %v", err)
+			}
+		}
+		
+		dngConfig := processor.DNGConverterConfig{
+			ExecutablePath: cfg.DNGConverterPath,
+			OutputDir:      dngOutputDir,
+			Compressed:     cfg.DNGCompressed,
+			EmbedOriginal:  cfg.DNGEmbedOriginal,
+		}
+		
+		var err error
+		dngConverter, err = processor.NewDNGConverter(dngConfig)
+		if err != nil {
+			return fmt.Errorf("failed to initialize DNG Converter: %v", err)
+		}
+		
+		logSuccess("DNG Converter initialized (output: %s)", dngOutputDir)
+	}
+
 	// Initialize RawTherapee processor
 	logStep("Initializing RawTherapee processor...")
 	
@@ -383,12 +424,16 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 	}
 	
 	logInfo("Processing %d files with %d parallel workers...", len(newRAWFiles), numWorkers)
+	if cfg.ConvertToDNG {
+		logInfo("DNG conversion enabled for camera compatibility")
+	}
 	
 	// Define result structure for processed files
 	type processResult struct {
 		index      int
 		rawFile    scanner.FileInfo
 		outputPath string
+		dngPath    string // Path to intermediate DNG file (if conversion was used)
 		elapsed    time.Duration
 		err        error
 	}
@@ -408,13 +453,36 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			defer wg.Done()
 			for job := range jobs {
 				rtStart := time.Now()
-				outputPath, err := rt.ProcessFile(job.rawFile.Path)
+				var inputPath string
+				var dngPath string
+				var err error
+				
+				// Convert to DNG first if enabled
+				if dngConverter != nil {
+					dngPath, err = dngConverter.ConvertFile(job.rawFile.Path)
+					if err != nil {
+						results <- processResult{
+							index:   job.index,
+							rawFile: job.rawFile,
+							elapsed: time.Since(rtStart),
+							err:     fmt.Errorf("DNG conversion failed: %v", err),
+						}
+						continue
+					}
+					inputPath = dngPath
+				} else {
+					inputPath = job.rawFile.Path
+				}
+				
+				// Process with RawTherapee
+				outputPath, err := rt.ProcessFile(inputPath)
 				rtElapsed := time.Since(rtStart)
 				
 				results <- processResult{
 					index:      job.index,
 					rawFile:    job.rawFile,
 					outputPath: outputPath,
+					dngPath:    dngPath,
 					elapsed:    rtElapsed,
 					err:        err,
 				}
@@ -449,6 +517,12 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 		}
 
 		processedJPGs = append(processedJPGs, result.outputPath)
+		
+		// Track DNG files for cleanup
+		if result.dngPath != "" {
+			dngFilesToCleanup = append(dngFilesToCleanup, result.dngPath)
+		}
+		
 		logSuccess("[%d/%d] Created: %s (%.1fs)", processedCount, len(newRAWFiles), filepath.Base(result.outputPath), result.elapsed.Seconds())
 
 		// Find matching camera JPG if enabled
@@ -465,9 +539,13 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 		appState.MarkProcessed(result.rawFile.Name, profileName, result.outputPath)
 	}
 
-	// Log total RawTherapee processing time
+	// Log total processing time
 	if len(processedJPGs) > 0 {
-		logTiming(fmt.Sprintf("RawTherapee processing (%d files)", len(processedJPGs)), time.Now().Add(-totalRawProcessingTime))
+		if cfg.ConvertToDNG {
+			logTiming(fmt.Sprintf("DNG conversion + RawTherapee processing (%d files)", len(processedJPGs)), time.Now().Add(-totalRawProcessingTime))
+		} else {
+			logTiming(fmt.Sprintf("RawTherapee processing (%d files)", len(processedJPGs)), time.Now().Add(-totalRawProcessingTime))
+		}
 	}
 
 	// Upload processed JPGs (unless skip-upload is enabled)
@@ -561,6 +639,20 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			}
 		}
 		logSuccess("Deleted %d processed files", cleanupCount)
+	}
+
+	// Cleanup intermediate DNG files (if conversion was used and cleanup is enabled)
+	if cfg.ConvertToDNG && cfg.CleanupDNGFiles && len(dngFilesToCleanup) > 0 {
+		logStep("Cleaning up intermediate DNG files...")
+		dngCleanupCount := 0
+		for _, dngPath := range dngFilesToCleanup {
+			if err := os.Remove(dngPath); err != nil {
+				logError("Failed to delete DNG %s: %v", filepath.Base(dngPath), err)
+			} else {
+				dngCleanupCount++
+			}
+		}
+		logSuccess("Deleted %d intermediate DNG files", dngCleanupCount)
 	}
 
 	// Save state
