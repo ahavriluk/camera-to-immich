@@ -127,7 +127,7 @@ This creates a sample configuration file at:
 | `upload_camera_jpgs` | Also upload camera-generated JPGs (when processing RAW) | `true` |
 | `tag_with_profile_name` | Tag processed files with profile name | `true` |
 | `cleanup_after_upload` | Delete processed files after successful upload to save disk space | `true` |
-| `workers` | Number of parallel workers for RAW processing (0 = auto-detect based on CPU cores) | `0` (auto) |
+| `workers` | Number of parallel workers for RAW processing (0 = auto, max 4 to prevent memory issues) | `0` (auto, max 4) |
 | `dry_run` | Preview without processing/uploading | `false` |
 
 ### Camera-Specific Examples
@@ -258,8 +258,12 @@ camera-to-immich -workers 8
 
 The tool supports parallel RAW processing to take advantage of multi-core CPUs:
 
-- By default, the tool auto-detects the number of CPU cores and uses that many parallel workers
-- Use `-workers N` to manually set the number of workers
+- By default, the tool uses up to **4 parallel workers** (capped to prevent memory exhaustion)
+- RawTherapee uses ~1-2GB RAM per instance, so running too many in parallel can cause out-of-memory errors
+- Use `-workers N` to manually set the number of workers based on your available RAM:
+  - **4 workers** recommended for 16 GB RAM
+  - **6-8 workers** recommended for 32 GB RAM
+  - **12-16 workers** recommended for 64 GB RAM
 - Example: With 4 workers processing 8 files, total time is ~3.4x faster than sequential processing
 
 **Benchmark (8 files with 4 workers):**

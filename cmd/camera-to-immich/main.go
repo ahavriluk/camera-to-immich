@@ -366,9 +366,16 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 	var totalRawProcessingTime time.Duration
 	
 	// Determine number of workers for parallel processing
+	// Default to 4 workers max to avoid memory issues (RawTherapee uses ~1-2GB per instance)
+	// Users can override with --workers flag or config for systems with more RAM
+	const defaultMaxWorkers = 4
 	numWorkers := cfg.Workers
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
+		// Cap at default max to avoid memory exhaustion
+		if numWorkers > defaultMaxWorkers {
+			numWorkers = defaultMaxWorkers
+		}
 	}
 	// Don't use more workers than files
 	if numWorkers > len(newRAWFiles) {
