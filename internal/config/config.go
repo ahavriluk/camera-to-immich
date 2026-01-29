@@ -56,6 +56,8 @@ func DefaultConfig() *Config {
 		DriveLabel:          "OM SYSTEM",
 		RawExtensions:       []string{".ORF"}, // Olympus RAW format by default
 		ConvertToDNG:        false,            // Disabled by default
+		DNGCompressed:       false,            // Use lossless DNG by default (higher quality)
+		DNGEmbedOriginal:    false,            // Don't embed original (smaller files)
 		CleanupDNGFiles:     true,             // Clean up intermediate DNG files
 		JPEGQuality:         92,
 		OutputDirectory:     filepath.Join(homeDir, ".camera-to-immich", "output"),
