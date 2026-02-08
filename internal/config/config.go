@@ -26,7 +26,8 @@ type Config struct {
 
 	// RawTherapee settings
 	RawTherapeeExecutable string `json:"rawtherapee_executable"` // Path to rawtherapee-cli
-	PP3ProfilePath        string `json:"pp3_profile_path"`       // Path to the PP3 profile
+	PP3ProfilePath        string `json:"pp3_profile_path"`       // Path to the PP3 profile (color)
+	PP3BWProfilePath      string `json:"pp3_bw_profile_path"`    // Path to B&W PP3 profile (optional, for B&W images)
 	JPEGQuality           int    `json:"jpeg_quality"`           // JPEG output quality (1-100)
 	OutputDirectory       string `json:"output_directory"`       // Directory for processed files
 
@@ -44,6 +45,7 @@ type Config struct {
 	CleanupAfterUpload   bool `json:"cleanup_after_upload"`    // Delete processed files after successful upload
 	DryRun               bool `json:"dry_run"`                 // Don't actually process/upload, just show what would happen
 	SkipUpload           bool `json:"skip_upload"`             // Process files but skip uploading to Immich
+	NoUploadUI           bool `json:"no_upload_ui"`            // Suppress immich-go UI during upload (quiet mode)
 	Limit                int  `json:"limit"`                   // Limit number of files to process (0 = no limit)
 	Workers              int  `json:"workers"`                 // Number of parallel workers for processing (0 = auto based on CPU cores)
 }

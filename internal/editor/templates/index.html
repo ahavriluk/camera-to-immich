@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera-to-Immich</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="logo">📷 Camera-to-Immich</div>
+        
+        <div class="header-actions">
+            <div class="stats">
+                <span id="edited-count">0</span> edited of <span id="total-count">0</span>
+            </div>
+            
+            <div class="preset-toggle">
+                <button id="global-color" class="active" onclick="setGlobalPreset('color')">Color</button>
+                <button id="global-bw" onclick="setGlobalPreset('bw')">B&W</button>
+            </div>
+            
+            <button class="btn btn-primary" onclick="processAll()">
+                Process All →
+            </button>
+        </div>
+    </header>
+
+    <!-- Grid View -->
+    <main class="grid" id="image-grid">
+        <!-- Demo thumbnails for preview -->
+        <div class="grid-item" onclick="openModal(0)">
+            <img src="https://picsum.photos/seed/1/300/200" alt="Demo 1">
+            <span class="filename">IMG_0001.CR2</span>
+        </div>
+        <div class="grid-item edited" onclick="openModal(1)">
+            <img src="https://picsum.photos/seed/2/300/200" alt="Demo 2">
+            <span class="filename">IMG_0002.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(2)">
+            <img src="https://picsum.photos/seed/3/300/200" alt="Demo 3">
+            <span class="filename">IMG_0003.CR2</span>
+        </div>
+        <div class="grid-item skipped" onclick="openModal(3)">
+            <img src="https://picsum.photos/seed/4/300/200" alt="Demo 4">
+            <span class="filename">IMG_0004.CR2</span>
+        </div>
+        <div class="grid-item edited" onclick="openModal(4)">
+            <img src="https://picsum.photos/seed/5/300/200" alt="Demo 5">
+            <span class="filename">IMG_0005.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(5)">
+            <img src="https://picsum.photos/seed/6/300/200" alt="Demo 6">
+            <span class="filename">IMG_0006.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(6)">
+            <img src="https://picsum.photos/seed/7/300/200" alt="Demo 7">
+            <span class="filename">IMG_0007.CR2</span>
+        </div>
+        <div class="grid-item edited" onclick="openModal(7)">
+            <img src="https://picsum.photos/seed/8/300/200" alt="Demo 8">
+            <span class="filename">IMG_0008.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(8)">
+            <img src="https://picsum.photos/seed/9/300/200" alt="Demo 9">
+            <span class="filename">IMG_0009.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(9)">
+            <img src="https://picsum.photos/seed/10/300/200" alt="Demo 10">
+            <span class="filename">IMG_0010.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(10)">
+            <img src="https://picsum.photos/seed/11/300/200" alt="Demo 11">
+            <span class="filename">IMG_0011.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(11)">
+            <img src="https://picsum.photos/seed/12/300/200" alt="Demo 12">
+            <span class="filename">IMG_0012.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(12)">
+            <img src="https://picsum.photos/seed/13/300/200" alt="Demo 13">
+            <span class="filename">IMG_0013.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(13)">
+            <img src="https://picsum.photos/seed/14/300/200" alt="Demo 14">
+            <span class="filename">IMG_0014.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(14)">
+            <img src="https://picsum.photos/seed/15/300/200" alt="Demo 15">
+            <span class="filename">IMG_0015.CR2</span>
+        </div>
+        <div class="grid-item" onclick="openModal(15)">
+            <img src="https://picsum.photos/seed/16/300/200" alt="Demo 16">
+            <span class="filename">IMG_0016.CR2</span>
+        </div>
+    </main>
+
+    <!-- Edit Modal -->
+    <div class="modal-overlay" id="modal">
+        <button class="close-btn" onclick="closeModal()">×</button>
+        
+        <div class="modal">
+            <!-- Preview (on left) -->
+            <div class="preview-area">
+                <div class="preview-header">
+                    <button class="nav-arrow" onclick="prevImage()">◀</button>
+                    <h2 id="modal-filename">IMG_0001.CR2</h2>
+                    <button class="nav-arrow" onclick="nextImage()">▶</button>
+                </div>
+                
+                <div class="preview-container" id="preview-container">
+                    <img id="preview-image" src="https://picsum.photos/seed/1/1200/800" alt="Preview">
+                    <div class="grid-lines" id="grid-lines"></div>
+                    <div class="rotation-crop-overlay" id="rotation-crop-overlay">
+                        <div class="rotation-crop-box" id="rotation-crop-box"></div>
+                    </div>
+                    <div class="crop-overlay" id="crop-overlay">
+                        <div class="crop-area" id="crop-area">
+                            <div class="crop-handle tl" data-handle="tl"></div>
+                            <div class="crop-handle tr" data-handle="tr"></div>
+                            <div class="crop-handle bl" data-handle="bl"></div>
+                            <div class="crop-handle br" data-handle="br"></div>
+                            <div class="rotate-handle" id="rotate-handle">↻</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="keyboard-hint">
+                    <kbd>←</kbd> <kbd>→</kbd> navigate &nbsp;
+                    <kbd>↑</kbd> <kbd>↓</kbd> exposure &nbsp;
+                    <kbd>B</kbd> toggle B&W &nbsp;
+                    <kbd>R</kbd> reset all &nbsp;
+                    <kbd>Esc</kbd> close
+                </div>
+            </div>
+            
+            <!-- Controls (on right) -->
+            <div class="controls">
+                <!-- Exposure -->
+                <div class="control-group">
+                    <div class="control-label-row">
+                        <label>Exposure (EV)</label>
+                        <button class="reset-btn" onclick="resetExposure()" title="Reset exposure">↺</button>
+                    </div>
+                    <div class="exposure-presets">
+                        <button class="ev-btn" onclick="setExposure(-1.0)" data-ev="-1.0">-1</button>
+                        <button class="ev-btn" onclick="setExposure(-0.7)" data-ev="-0.7">-⅔</button>
+                        <button class="ev-btn" onclick="setExposure(-0.3)" data-ev="-0.3">-⅓</button>
+                        <button class="ev-btn active" onclick="setExposure(0)" data-ev="0">0</button>
+                        <button class="ev-btn" onclick="setExposure(0.3)" data-ev="0.3">+⅓</button>
+                        <button class="ev-btn" onclick="setExposure(0.7)" data-ev="0.7">+⅔</button>
+                        <button class="ev-btn" onclick="setExposure(1.0)" data-ev="1.0">+1</button>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label">-2</span>
+                        <input type="range" id="exposure" min="-2" max="2" step="0.1" value="0" 
+                               oninput="updateExposure(this.value)" 
+                               list="exposure-stops">
+                        <span class="slider-label">+2</span>
+                        <span class="slider-value" id="exposure-value">0</span>
+                    </div>
+                    <datalist id="exposure-stops">
+                        <option value="-2"></option>
+                        <option value="-1.7"></option>
+                        <option value="-1.3"></option>
+                        <option value="-1"></option>
+                        <option value="-0.7"></option>
+                        <option value="-0.3"></option>
+                        <option value="0"></option>
+                        <option value="0.3"></option>
+                        <option value="0.7"></option>
+                        <option value="1"></option>
+                        <option value="1.3"></option>
+                        <option value="1.7"></option>
+                        <option value="2"></option>
+                    </datalist>
+                </div>
+                
+                <!-- Rotation -->
+                <div class="control-group">
+                    <div class="control-label-row">
+                        <label>Straighten</label>
+                        <button class="reset-btn" onclick="resetRotation()" title="Reset rotation">↺</button>
+                    </div>
+                    <div class="slider-row">
+                        <span class="slider-label">-15°</span>
+                        <input type="range" id="rotation" min="-15" max="15" step="0.1" value="0" oninput="updateRotation(this.value)">
+                        <span class="slider-label">+15°</span>
+                        <span class="slider-value" id="rotation-value">0°</span>
+                    </div>
+                </div>
+                
+                <!-- Crop Aspect Ratio -->
+                <div class="control-group">
+                    <div class="control-label-row">
+                        <label>Crop</label>
+                        <button class="reset-btn" onclick="resetCrop()" title="Reset crop">↺</button>
+                    </div>
+                    <div class="aspect-buttons">
+                        <button onclick="setAspect('free')" class="active" data-aspect="free">Free</button>
+                        <button onclick="setAspect('original')" data-aspect="original">Original</button>
+                        <button onclick="setAspect('1:1')" data-aspect="1:1">1:1</button>
+                        <button onclick="setAspect('3:2')" data-aspect="3:2">3:2</button>
+                        <button onclick="setAspect('4:3')" data-aspect="4:3">4:3</button>
+                        <button onclick="setAspect('16:9')" data-aspect="16:9">16:9</button>
+                    </div>
+                </div>
+                
+                <!-- B&W Toggle -->
+                <div class="control-group">
+                    <div class="control-label-row">
+                        <label>Output Style</label>
+                    </div>
+                    <div class="bw-toggle">
+                        <button class="color-btn active" onclick="setBW(false)" id="color-btn">Color</button>
+                        <button class="bw-btn" onclick="setBW(true)" id="bw-btn">B&W</button>
+                    </div>
+                </div>
+                
+                <!-- Spacer -->
+                <div class="control-spacer"></div>
+                
+                <!-- Actions -->
+                <div class="action-buttons">
+                    <button class="btn-reset" onclick="resetEdit()">Reset All</button>
+                    <button class="btn-skip" onclick="skipImage()">Skip Image</button>
+                </div>
+                <button class="btn-done" onclick="closeModal()">Done ✓</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="editor.js"></script>
+</body>
+</html>

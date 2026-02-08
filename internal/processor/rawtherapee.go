@@ -1,20 +1,23 @@
 package processor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // RawTherapeeConfig contains configuration for RawTherapee processing
 type RawTherapeeConfig struct {
-	ExecutablePath string // Path to rawtherapee-cli executable
-	ProfilePath    string // Path to the PP3 profile file
-	OutputDir      string // Directory for processed JPEGs
-	Quality        int    // JPEG quality (1-100)
+	ExecutablePath string        // Path to rawtherapee-cli executable
+	ProfilePath    string        // Path to the PP3 profile file
+	OutputDir      string        // Directory for processed JPEGs
+	Quality        int           // JPEG quality (1-100)
+	Timeout        time.Duration // Timeout for processing a single file (0 = no timeout)
 }
 
 // RawTherapee handles processing ORF files with RawTherapee CLI
@@ -56,7 +59,14 @@ func NewRawTherapee(config RawTherapeeConfig) (*RawTherapee, error) {
 }
 
 // ProcessFile processes a single ORF file and returns the path to the output JPEG
+// Uses the default profile configured in RawTherapeeConfig
 func (rt *RawTherapee) ProcessFile(inputPath string) (string, error) {
+	return rt.ProcessFileWithProfile(inputPath, rt.config.ProfilePath)
+}
+
+// ProcessFileWithProfile processes a single RAW file with a specific PP3 profile
+// If profilePath is empty, processes without a profile (RawTherapee defaults)
+func (rt *RawTherapee) ProcessFileWithProfile(inputPath string, profilePath string) (string, error) {
 	// Determine output path
 	baseName := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
 	outputPath := filepath.Join(rt.config.OutputDir, baseName+".jpg")
@@ -69,16 +79,32 @@ func (rt *RawTherapee) ProcessFile(inputPath string) (string, error) {
 	}
 
 	// Add profile if specified
-	if rt.config.ProfilePath != "" {
-		args = append(args, "-p", rt.config.ProfilePath)
+	if profilePath != "" {
+		args = append(args, "-p", profilePath)
 	}
 
 	// Add input file
 	args = append(args, "-c", inputPath)
 
-	// Execute rawtherapee-cli
-	cmd := exec.Command(rt.config.ExecutablePath, args...)
+	// Execute rawtherapee-cli with optional timeout
+	var cmd *exec.Cmd
+	var ctx context.Context
+	var cancel context.CancelFunc
+	
+	timeout := rt.config.Timeout
+	if timeout == 0 {
+		timeout = 5 * time.Minute // Default 5 minute timeout per file
+	}
+	
+	ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	
+	cmd = exec.CommandContext(ctx, rt.config.ExecutablePath, args...)
 	output, err := cmd.CombinedOutput()
+	
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("rawtherapee-cli timed out after %v", timeout)
+	}
 	if err != nil {
 		return "", fmt.Errorf("rawtherapee-cli failed: %v\nOutput: %s", err, string(output))
 	}
@@ -89,6 +115,18 @@ func (rt *RawTherapee) ProcessFile(inputPath string) (string, error) {
 	}
 
 	return outputPath, nil
+}
+
+// GetPerImageProfilePath returns the path to a per-image PP3 profile if it exists
+// Returns empty string if no per-image profile exists
+func (rt *RawTherapee) GetPerImageProfilePath(imagePath string) string {
+	baseName := strings.TrimSuffix(filepath.Base(imagePath), filepath.Ext(imagePath))
+	pp3Path := filepath.Join(rt.config.OutputDir, baseName+".pp3")
+	
+	if _, err := os.Stat(pp3Path); err == nil {
+		return pp3Path
+	}
+	return ""
 }
 
 // GetProfileName returns the name of the PP3 profile being used

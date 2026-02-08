@@ -95,6 +95,7 @@ This creates a sample configuration file at:
   "cleanup_dng_files": true,
   "rawtherapee_executable": "",
   "pp3_profile_path": "/path/to/your/profile.pp3",
+  "pp3_bw_profile_path": "/path/to/your/bw-profile.pp3",
   "jpeg_quality": 92,
   "output_directory": "/path/to/output",
   "immich_executable": "",
@@ -124,7 +125,8 @@ This creates a sample configuration file at:
 | `dng_embed_original` | Embed original RAW in DNG (larger files) | `false` |
 | `cleanup_dng_files` | Delete intermediate DNG files after processing | `true` |
 | `rawtherapee_executable` | Path to rawtherapee-cli (auto-detected if empty) | Auto |
-| `pp3_profile_path` | Path to your PP3 processing profile | Required (if processing RAW) |
+| `pp3_profile_path` | Path to your PP3 processing profile (for color images) | Required (if processing RAW) |
+| `pp3_bw_profile_path` | Path to your B&W PP3 profile (optional, for B&W detection) | None |
 | `jpeg_quality` | Output JPEG quality (1-100) | `92` |
 | `output_directory` | Where to save processed JPEGs | `~/.camera-to-immich/output` |
 | `immich_executable` | Path to immich-go (auto-detected if empty) | Auto |
@@ -213,6 +215,35 @@ Some newer cameras (like the OM System OM-3) may not be natively supported by Ra
 - The DNG file may have slightly different characteristics than the original RAW
 - Test with a few files first to ensure your profile produces the desired results
 
+### B&W Detection for Camera B&W Shots
+
+When shooting in B&W mode on your camera, the JPG sidecar file is grayscale but the RAW file still contains full color data. The tool can automatically detect B&W images from the sidecar JPG and handle them specially:
+
+**How it works:**
+1. When processing images, the tool analyzes the sidecar JPG (camera-generated JPG)
+2. If ~95% of pixels are grayscale (R≈G≈B), the image is detected as B&W
+3. If `pp3_bw_profile_path` is configured and exists, the B&W profile is used to process the RAW
+4. If no B&W profile is configured, the sidecar JPG is uploaded instead (preserving the camera's B&W processing)
+5. B&W images are tagged with `b&w` tag for easy filtering in Immich
+
+**Configuration for B&W detection:**
+```json
+{
+  "pp3_profile_path": "/path/to/color/profile.pp3",
+  "pp3_bw_profile_path": "/path/to/bw/profile.pp3"
+}
+```
+
+**Tagging behavior:**
+- B&W processed images get: `b&w`, `processed`, `profile:YourBWProfileName`
+- B&W sidecar-only images get: `b&w`, `camera-original`
+- Color processed images get: `processed`, `profile:YourColorProfileName`
+
+This feature is useful for photographers who:
+- Shoot in B&W mode in-camera for creative preview
+- Want to use a dedicated B&W processing profile for their RAW files
+- Want to preserve the camera's B&W processing when no custom profile is available
+
 ## Usage
 
 ### Basic Usage
@@ -249,6 +280,8 @@ Options:
   -version           Show version information
   -state-info        Show state file information and exit
   -clear-state       Clear the processed files state and exit
+  -cache-info        Show cache information (size, file count) and exit
+  -clear-cache       Clear the preview image cache and exit
 ```
 
 ### Examples
@@ -283,6 +316,12 @@ camera-to-immich -clear-state
 
 # Process with 8 parallel workers (for multi-core CPUs)
 camera-to-immich -workers 8
+
+# Check cache size (preview images from web editor)
+camera-to-immich -cache-info
+
+# Clear the preview cache to free disk space
+camera-to-immich -clear-cache
 ```
 
 ## Workflow
@@ -319,7 +358,31 @@ The tool supports parallel RAW processing to take advantage of multi-core CPUs:
 ├── config.json      # Configuration file
 ├── state.json       # Processing state (tracked files)
 └── output/          # Default output directory for processed JPEGs
+    ├── *.jpg        # Processed JPEG files (cleaned up after upload)
+    └── .cache/      # Preview image cache (from web editor)
 ```
+
+## Cache Management
+
+When using the web editor (`-editor` mode), preview images are generated and cached to improve performance. Over time, this cache can grow significantly.
+
+### Automatic Cleanup
+- Cache files for processed images are automatically cleaned up after successful processing
+- This prevents the cache from growing indefinitely during normal usage
+
+### Manual Cleanup
+- **Check cache size**: `camera-to-immich -cache-info`
+- **Clear all cache**: `camera-to-immich -clear-cache`
+
+### Web Editor API
+When the web editor is running, you can also manage the cache via the API:
+- **GET `/api/cache`** - Get cache statistics (file count, total size)
+- **DELETE `/api/cache`** - Clear all cached preview files
+
+### Cache Location
+The cache is stored in `.cache` subdirectory of your output directory:
+- Default: `~/.camera-to-immich/output/.cache/`
+- Custom: `{output_directory}/.cache/`
 
 ## Troubleshooting
 

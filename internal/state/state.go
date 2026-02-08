@@ -33,8 +33,13 @@ type State struct {
 
 	// LastRun timestamp
 	LastRun time.Time `json:"last_run"`
+	
+	// LastProcessedFileTime is the modification time of the newest file processed
+	// Files with mod time <= this are considered already processed
+	LastProcessedFileTime time.Time `json:"last_processed_file_time,omitempty"`
 
 	// ProcessedFiles tracks files that have been processed from the current card
+	// This is kept for backward compatibility but primary filtering uses LastProcessedFileTime
 	ProcessedFiles map[string]ProcessedFile `json:"processed_files"`
 
 	statePath string
@@ -99,6 +104,10 @@ func Load(statePath string) (*State, error) {
 		state.ProcessedFiles = make(map[string]ProcessedFile)
 	}
 
+	// NOTE: Migration of LastProcessedFileTime is handled in the editor/main code
+	// by looking up actual file modification times from the card, not from ProcessedAt
+	// (ProcessedAt is when WE processed it, not the file's actual mod time)
+
 	state.statePath = statePath
 	return state, nil
 }
@@ -123,6 +132,16 @@ func (s *State) IsProcessed(filename string) bool {
 	return exists
 }
 
+// IsProcessedByTime checks if a file should be considered processed based on its modification time
+// Files with mod time <= LastProcessedFileTime are considered already processed
+func (s *State) IsProcessedByTime(fileModTime time.Time) bool {
+	if s.LastProcessedFileTime.IsZero() {
+		return false
+	}
+	// File is processed if its mod time is <= last processed time
+	return !fileModTime.After(s.LastProcessedFileTime)
+}
+
 // MarkProcessed marks a file as processed
 func (s *State) MarkProcessed(filename, profileUsed, outputPath string) {
 	s.ProcessedFiles[filename] = ProcessedFile{
@@ -131,6 +150,33 @@ func (s *State) MarkProcessed(filename, profileUsed, outputPath string) {
 		ProfileUsed: profileUsed,
 	}
 	s.LastRun = time.Now()
+}
+
+// MarkProcessedWithTime marks a file as processed and updates the high-water mark
+func (s *State) MarkProcessedWithTime(filename, profileUsed string, fileModTime time.Time) {
+	s.ProcessedFiles[filename] = ProcessedFile{
+		Filename:    filename,
+		ProcessedAt: time.Now(),
+		ProfileUsed: profileUsed,
+	}
+	s.LastRun = time.Now()
+	
+	// Update high-water mark if this file is newer
+	if fileModTime.After(s.LastProcessedFileTime) {
+		s.LastProcessedFileTime = fileModTime
+	}
+}
+
+// UpdateLastProcessedTime updates the high-water mark for processed files
+func (s *State) UpdateLastProcessedTime(fileModTime time.Time) {
+	if fileModTime.After(s.LastProcessedFileTime) {
+		s.LastProcessedFileTime = fileModTime
+	}
+}
+
+// GetLastProcessedTime returns the high-water mark timestamp
+func (s *State) GetLastProcessedTime() time.Time {
+	return s.LastProcessedFileTime
 }
 
 // GetProcessedFilesMap returns a map for quick lookup of processed files
