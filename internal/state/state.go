@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ProcessedFile represents a file that has been processed
+// ProcessedFile represents a file that has been processed (kept for backward compatibility)
 type ProcessedFile struct {
 	Filename    string    `json:"filename"`
 	ProcessedAt time.Time `json:"processed_at"`
@@ -23,7 +23,7 @@ type LegacyState struct {
 }
 
 // State represents the application state that persists between runs
-// Only tracks files from the current/last connected card
+// Uses time-based tracking: files with mod time <= LastProcessedFileTime are considered processed
 type State struct {
 	// Version of the state file format
 	Version int `json:"version"`
@@ -36,11 +36,12 @@ type State struct {
 	
 	// LastProcessedFileTime is the modification time of the newest file processed
 	// Files with mod time <= this are considered already processed
+	// This is the PRIMARY mechanism for tracking processed files
 	LastProcessedFileTime time.Time `json:"last_processed_file_time,omitempty"`
 
-	// ProcessedFiles tracks files that have been processed from the current card
-	// This is kept for backward compatibility but primary filtering uses LastProcessedFileTime
-	ProcessedFiles map[string]ProcessedFile `json:"processed_files"`
+	// ProcessedFiles is deprecated and kept only for backward compatibility during migration
+	// New code should not rely on this - use LastProcessedFileTime instead
+	ProcessedFiles map[string]ProcessedFile `json:"processed_files,omitempty"`
 
 	statePath string
 }
@@ -57,9 +58,8 @@ func DefaultStatePath() (string, error) {
 // Load loads the state from the specified path
 func Load(statePath string) (*State, error) {
 	state := &State{
-		statePath:      statePath,
-		ProcessedFiles: make(map[string]ProcessedFile),
-		Version:        2,
+		statePath: statePath,
+		Version:   3, // Version 3: time-based tracking only
 	}
 
 	// Ensure the directory exists
@@ -83,13 +83,9 @@ func Load(statePath string) (*State, error) {
 		var legacy LegacyState
 		if legacyErr := json.Unmarshal(data, &legacy); legacyErr == nil {
 			// Successfully parsed as legacy format, migrate it
-			state.ProcessedFiles = make(map[string]ProcessedFile)
-			for _, pf := range legacy.ProcessedFiles {
-				state.ProcessedFiles[pf.Filename] = pf
-			}
 			state.LastRun = legacy.LastProcessedTimestamp
-			state.Version = 2
-			// Save in new format
+			state.Version = 3
+			// Note: Legacy format doesn't have LastProcessedFileTime, it will be derived on first run
 			state.statePath = statePath
 			if saveErr := state.Save(); saveErr != nil {
 				// Non-fatal: just log that we couldn't save
@@ -100,13 +96,11 @@ func Load(statePath string) (*State, error) {
 		return nil, fmt.Errorf("failed to parse state file: %v", err)
 	}
 
-	if state.ProcessedFiles == nil {
-		state.ProcessedFiles = make(map[string]ProcessedFile)
+	// Clear deprecated ProcessedFiles on load (migration from v2 to v3)
+	if state.Version < 3 && len(state.ProcessedFiles) > 0 {
+		state.ProcessedFiles = nil
+		state.Version = 3
 	}
-
-	// NOTE: Migration of LastProcessedFileTime is handled in the editor/main code
-	// by looking up actual file modification times from the card, not from ProcessedAt
-	// (ProcessedAt is when WE processed it, not the file's actual mod time)
 
 	state.statePath = statePath
 	return state, nil
@@ -126,45 +120,33 @@ func (s *State) Save() error {
 	return nil
 }
 
-// IsProcessed checks if a file has already been processed
-func (s *State) IsProcessed(filename string) bool {
-	_, exists := s.ProcessedFiles[filename]
-	return exists
-}
-
-// IsProcessedByTime checks if a file should be considered processed based on its modification time
+// IsProcessed checks if a file should be considered processed based on its modification time
 // Files with mod time <= LastProcessedFileTime are considered already processed
-func (s *State) IsProcessedByTime(fileModTime time.Time) bool {
+func (s *State) IsProcessed(fileModTime time.Time) bool {
 	if s.LastProcessedFileTime.IsZero() {
 		return false
 	}
-	// File is processed if its mod time is <= last processed time
 	return !fileModTime.After(s.LastProcessedFileTime)
 }
 
-// MarkProcessed marks a file as processed
-func (s *State) MarkProcessed(filename, profileUsed, outputPath string) {
-	s.ProcessedFiles[filename] = ProcessedFile{
-		Filename:    filename,
-		ProcessedAt: time.Now(),
-		ProfileUsed: profileUsed,
-	}
-	s.LastRun = time.Now()
+// IsProcessedByTime is an alias for IsProcessed (for backward compatibility)
+func (s *State) IsProcessedByTime(fileModTime time.Time) bool {
+	return s.IsProcessed(fileModTime)
 }
 
-// MarkProcessedWithTime marks a file as processed and updates the high-water mark
-func (s *State) MarkProcessedWithTime(filename, profileUsed string, fileModTime time.Time) {
-	s.ProcessedFiles[filename] = ProcessedFile{
-		Filename:    filename,
-		ProcessedAt: time.Now(),
-		ProfileUsed: profileUsed,
-	}
+// MarkProcessed marks a file as processed by updating the high-water mark
+// The fileModTime should be the file's modification time on the card
+func (s *State) MarkProcessed(fileModTime time.Time) {
 	s.LastRun = time.Now()
-	
-	// Update high-water mark if this file is newer
 	if fileModTime.After(s.LastProcessedFileTime) {
 		s.LastProcessedFileTime = fileModTime
 	}
+}
+
+// MarkProcessedWithTime marks a file as processed and updates the high-water mark
+// Kept for backward compatibility - the filename and profileUsed are ignored
+func (s *State) MarkProcessedWithTime(filename, profileUsed string, fileModTime time.Time) {
+	s.MarkProcessed(fileModTime)
 }
 
 // UpdateLastProcessedTime updates the high-water mark for processed files
@@ -179,31 +161,26 @@ func (s *State) GetLastProcessedTime() time.Time {
 	return s.LastProcessedFileTime
 }
 
-// GetProcessedFilesMap returns a map for quick lookup of processed files
+// GetProcessedFilesMap returns an empty map (deprecated - use time-based filtering)
 func (s *State) GetProcessedFilesMap() map[string]bool {
-	result := make(map[string]bool)
-	for filename := range s.ProcessedFiles {
-		result[filename] = true
-	}
-	return result
+	return make(map[string]bool)
 }
 
-// GetProcessedCount returns the number of processed files
+// GetProcessedCount returns 0 (deprecated - no longer tracking individual files)
 func (s *State) GetProcessedCount() int {
-	return len(s.ProcessedFiles)
+	return 0
 }
 
-// SyncWithCard removes entries for files no longer on the card
-// This keeps the state file clean and prevents stale entries
+// SyncWithCard is deprecated - no longer needed with time-based tracking
 func (s *State) SyncWithCard(filesOnCard map[string]bool) int {
-	removed := 0
-	for filename := range s.ProcessedFiles {
-		if !filesOnCard[filename] {
-			delete(s.ProcessedFiles, filename)
-			removed++
-		}
-	}
-	return removed
+	return 0
+}
+
+// PruneProcessedFiles clears any remaining entries (migration cleanup)
+func (s *State) PruneProcessedFiles() int {
+	pruned := len(s.ProcessedFiles)
+	s.ProcessedFiles = nil
+	return pruned
 }
 
 // SetCardID sets an identifier for the current card
@@ -211,29 +188,36 @@ func (s *State) SetCardID(id string) {
 	s.CardID = id
 }
 
-// Clear removes all state
+// Clear removes all state including the time-based high-water mark
 func (s *State) Clear() int {
-	count := len(s.ProcessedFiles)
-	s.ProcessedFiles = make(map[string]ProcessedFile)
+	s.ProcessedFiles = nil
 	s.CardID = ""
 	s.LastRun = time.Time{}
-	return count
+	s.LastProcessedFileTime = time.Time{}
+	return 0
+}
+
+// ResetToTime sets the high-water mark to a specific time
+// Files with mod time > this time will be shown as unprocessed
+func (s *State) ResetToTime(t time.Time) {
+	s.LastProcessedFileTime = t
+	s.ProcessedFiles = nil
 }
 
 // Stats returns statistics about the state
 type Stats struct {
-	ProcessedCount int
-	LastRun        time.Time
-	CardID         string
-	FileSizeBytes  int64
+	LastProcessedTime time.Time
+	LastRun           time.Time
+	CardID            string
+	FileSizeBytes     int64
 }
 
 // GetStats returns statistics about the state
 func (s *State) GetStats() Stats {
 	stats := Stats{
-		ProcessedCount: len(s.ProcessedFiles),
-		LastRun:        s.LastRun,
-		CardID:         s.CardID,
+		LastProcessedTime: s.LastProcessedFileTime,
+		LastRun:           s.LastRun,
+		CardID:            s.CardID,
 	}
 
 	if info, err := os.Stat(s.statePath); err == nil {

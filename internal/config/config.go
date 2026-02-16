@@ -23,6 +23,8 @@ type Config struct {
 	DNGCompressed        bool   `json:"dng_compressed"`          // Use compressed DNG format (smaller files)
 	DNGEmbedOriginal     bool   `json:"dng_embed_original"`      // Embed original raw in DNG (larger files)
 	CleanupDNGFiles      bool   `json:"cleanup_dng_files"`       // Delete intermediate DNG files after processing
+	DNGMaxRetries        int    `json:"dng_max_retries"`         // Maximum retry attempts for DNG conversion (default: 3)
+	DNGRetryDelaySeconds int    `json:"dng_retry_delay_seconds"` // Initial delay between retries in seconds (default: 2, doubles each retry)
 
 	// RawTherapee settings
 	RawTherapeeExecutable string `json:"rawtherapee_executable"` // Path to rawtherapee-cli
@@ -30,6 +32,10 @@ type Config struct {
 	PP3BWProfilePath      string `json:"pp3_bw_profile_path"`    // Path to B&W PP3 profile (optional, for B&W images)
 	JPEGQuality           int    `json:"jpeg_quality"`           // JPEG output quality (1-100)
 	OutputDirectory       string `json:"output_directory"`       // Directory for processed files
+
+	// Tone Calibration settings (for OM-3 cameras)
+	ToneFormulaPath  string `json:"tone_formula_path"`  // Path to tone mapping formula JSON (from tone-calibrator)
+	ApplyToneFormula bool   `json:"apply_tone_formula"` // Apply tone formula based on camera JPEG EXIF settings (uses pp3_profile_path as base)
 
 	// Immich settings
 	ImmichExecutable string   `json:"immich_executable"` // Path to immich-go
@@ -55,19 +61,21 @@ func DefaultConfig() *Config {
 	homeDir, _ := os.UserHomeDir()
 	
 	return &Config{
-		DriveLabel:          "OM SYSTEM",
-		RawExtensions:       []string{".ORF"}, // Olympus RAW format by default
-		ConvertToDNG:        false,            // Disabled by default
-		DNGCompressed:       false,            // Use lossless DNG by default (higher quality)
-		DNGEmbedOriginal:    false,            // Don't embed original (smaller files)
-		CleanupDNGFiles:     true,             // Clean up intermediate DNG files
-		JPEGQuality:         92,
-		OutputDirectory:     filepath.Join(homeDir, ".camera-to-immich", "output"),
-		ProcessRAWFiles:     true,
-		UploadCameraJPGs:    true,
-		TagWithProfileName:  true,
-		CleanupAfterUpload:  true, // Default to cleaning up to save disk space
-		DryRun:              false,
+		DriveLabel:           "OM SYSTEM",
+		RawExtensions:        []string{".ORF"}, // Olympus RAW format by default
+		ConvertToDNG:         false,            // Disabled by default
+		DNGCompressed:        false,            // Use lossless DNG by default (higher quality)
+		DNGEmbedOriginal:     false,            // Don't embed original (smaller files)
+		CleanupDNGFiles:      true,             // Clean up intermediate DNG files
+		DNGMaxRetries:        3,                // Default to 3 retry attempts
+		DNGRetryDelaySeconds: 2,                // Default to 2 seconds initial delay
+		JPEGQuality:          92,
+		OutputDirectory:      filepath.Join(homeDir, ".camera-to-immich", "output"),
+		ProcessRAWFiles:      true,
+		UploadCameraJPGs:     true,
+		TagWithProfileName:   true,
+		CleanupAfterUpload:   true, // Default to cleaning up to save disk space
+		DryRun:               false,
 	}
 }
 

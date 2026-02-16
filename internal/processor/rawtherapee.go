@@ -149,8 +149,9 @@ func findRawTherapeeExecutable() string {
 
 	switch runtime.GOOS {
 	case "windows":
-		names = append(names, 
+		names = append(names,
 			"rawtherapee-cli.exe",
+			`C:\Program Files\RawTherapee\5.12\rawtherapee-cli.exe`,
 			`C:\Program Files\RawTherapee\rawtherapee-cli.exe`,
 			`C:\Program Files (x86)\RawTherapee\rawtherapee-cli.exe`,
 		)

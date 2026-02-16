@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -174,6 +175,11 @@ func main() {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
+	// Check required external tools
+	if err := checkRequiredTools(cfg); err != nil {
+		log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+	}
+
 	// Run the processor
 	if err := run(cfg, *verbose); err != nil {
 		log.Fatalf("Processing failed: %v", err)
@@ -219,7 +225,12 @@ func showStateInfo() {
 	fmt.Println("State File Information")
 	fmt.Println("======================")
 	fmt.Printf("Path: %s\n", statePath)
-	fmt.Printf("Processed files tracked: %d\n", stats.ProcessedCount)
+	if !stats.LastProcessedTime.IsZero() {
+		fmt.Printf("Last processed file time: %s\n", stats.LastProcessedTime.Format("2006-01-02 15:04:05"))
+		fmt.Println("  (Files with mod time > this will be shown as unprocessed)")
+	} else {
+		fmt.Println("Last processed file time: not set (all files will be shown)")
+	}
 	if stats.FileSizeBytes > 0 {
 		fmt.Printf("File size: %d bytes\n", stats.FileSizeBytes)
 	}
@@ -381,7 +392,10 @@ func run(cfg *config.Config, verbose bool) error {
 	}
 
 	if verbose {
-		logInfo("Previously processed %d files", appState.GetProcessedCount())
+		lastProcessedTime := appState.GetLastProcessedTime()
+		if !lastProcessedTime.IsZero() {
+			logInfo("Files with mod time > %s will be processed", lastProcessedTime.Format("2006-01-02 15:04:05"))
+		}
 	}
 
 	// Step 3: Scan for images
@@ -396,19 +410,6 @@ func run(cfg *config.Config, verbose bool) error {
 
 	logInfo("Found %d RAW files and %d JPG files", len(scanResult.RAWFiles), len(scanResult.JPGFiles))
 	logTiming("File scanning", scanStart)
-
-	// Sync state with current card contents (remove entries for files no longer on card)
-	filesOnCard := make(map[string]bool)
-	for _, f := range scanResult.RAWFiles {
-		filesOnCard[f.Name] = true
-	}
-	for _, f := range scanResult.JPGFiles {
-		filesOnCard[f.Name] = true
-	}
-	removed := appState.SyncWithCard(filesOnCard)
-	if removed > 0 && verbose {
-		logInfo("Cleaned up %d stale entries from state (files no longer on card)", removed)
-	}
 
 	// Step 4: Initialize Immich uploader (skip if upload is disabled)
 	var im *uploader.Immich
@@ -451,9 +452,9 @@ func run(cfg *config.Config, verbose bool) error {
 
 // runWithRAWProcessing handles the workflow when RAW processing is enabled
 func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
-	// Filter unprocessed RAW files
-	processedMap := appState.GetProcessedFilesMap()
-	newRAWFiles := scanner.FilterNewFiles(scanResult.RAWFiles, processedMap)
+	// Filter unprocessed RAW files using time-based high-water mark
+	lastProcessedTime := appState.GetLastProcessedTime()
+	newRAWFiles := scanner.FilterNewFilesWithTime(scanResult.RAWFiles, nil, lastProcessedTime)
 
 	if len(newRAWFiles) == 0 {
 		logSuccess("No new RAW files to process!")
@@ -506,6 +507,8 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			OutputDir:      dngOutputDir,
 			Compressed:     cfg.DNGCompressed,
 			EmbedOriginal:  cfg.DNGEmbedOriginal,
+			MaxRetries:     cfg.DNGMaxRetries,
+			RetryDelay:     time.Duration(cfg.DNGRetryDelaySeconds) * time.Second,
 		}
 
 		var err error
@@ -534,6 +537,37 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 
 	profileName := rt.GetProfileName()
 	logSuccess("Using profile: %s", profileName)
+
+	// Initialize Tone Calibration if enabled (for OM-3 cameras)
+	var toneCalibration *processor.ToneCalibration
+	var basePP3Content string
+	if cfg.ApplyToneFormula && cfg.ToneFormulaPath != "" {
+		logStep("Initializing Tone Calibration with formula...")
+		var err error
+		toneCalibration, err = processor.NewToneCalibrationForWorkflow(cfg.ToneFormulaPath)
+		if err != nil {
+			logInfo("Note: Failed to initialize tone calibration: %v (continuing without)", err)
+			toneCalibration = nil
+		} else {
+			// Load base PP3 content from pp3_profile_path (default profile)
+			if cfg.PP3ProfilePath != "" {
+				data, err := os.ReadFile(cfg.PP3ProfilePath)
+				if err != nil {
+					logInfo("Note: Failed to load base PP3 file: %v (using minimal PP3)", err)
+				} else {
+					basePP3Content = string(data)
+					logSuccess("Tone calibration enabled (formula: %s, base: %s)",
+						filepath.Base(cfg.ToneFormulaPath), filepath.Base(cfg.PP3ProfilePath))
+				}
+			} else {
+				logSuccess("Tone calibration enabled (formula: %s)",
+					filepath.Base(cfg.ToneFormulaPath))
+			}
+		}
+	}
+	// Silence unused warnings if tone calibration not used (will be used in processing loop)
+	_ = toneCalibration
+	_ = basePP3Content
 
 	// Process and upload files
 	var processedJPGs []string
@@ -565,12 +599,13 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 
 	// Define result structure for processed files
 	type processResult struct {
-		index      int
-		rawFile    scanner.FileInfo
-		outputPath string
-		dngPath    string // Path to intermediate DNG file (if conversion was used)
-		elapsed    time.Duration
-		err        error
+		index        int
+		rawFile      scanner.FileInfo
+		outputPath   string
+		dngPath      string // Path to intermediate DNG file (if conversion was used)
+		elapsed      time.Duration
+		err          error
+		dngAttempts  int  // Number of DNG conversion attempts (0 if no DNG conversion)
 	}
 
 	// Create channels for job distribution and results
@@ -593,17 +628,21 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 				var err error
 
 				// Convert to DNG first if enabled
+				var dngAttempts int
 				if dngConverter != nil {
-					dngPath, err = dngConverter.ConvertFile(job.rawFile.Path)
-					if err != nil {
+					dngResult := dngConverter.ConvertFileWithRetry(job.rawFile.Path)
+					dngAttempts = dngResult.Attempts
+					if dngResult.LastError != nil {
 						results <- processResult{
-							index:   job.index,
-							rawFile: job.rawFile,
-							elapsed: time.Since(rtStart),
-							err:     fmt.Errorf("DNG conversion failed: %v", err),
+							index:       job.index,
+							rawFile:     job.rawFile,
+							elapsed:     time.Since(rtStart),
+							err:         fmt.Errorf("DNG conversion failed: %v", dngResult.LastError),
+							dngAttempts: dngAttempts,
 						}
 						continue
 					}
+					dngPath = dngResult.OutputPath
 					inputPath = dngPath
 				} else {
 					inputPath = job.rawFile.Path
@@ -617,6 +656,23 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 				if perImageProfile != "" {
 					// Use per-image profile from editor
 					outputPath, err = rt.ProcessFileWithProfile(inputPath, perImageProfile)
+				} else if toneCalibration != nil {
+					// Try to generate tone-adjusted profile from sidecar JPEG EXIF
+					tonePP3Path, toneErr := toneCalibration.GenerateTonePP3ForRAW(job.rawFile.Path, basePP3Content, cfg.OutputDirectory)
+					if toneErr == nil && tonePP3Path != "" {
+						if verbose {
+							logInfo("  Using tone-adjusted PP3: %s", filepath.Base(tonePP3Path))
+						}
+						outputPath, err = rt.ProcessFileWithProfile(inputPath, tonePP3Path)
+						// Clean up generated PP3 after processing
+						defer os.Remove(tonePP3Path)
+					} else {
+						// No sidecar JPEG or tone extraction failed, use default profile
+						if verbose && toneErr != nil {
+							logInfo("  Tone extraction note: %v", toneErr)
+						}
+						outputPath, err = rt.ProcessFile(inputPath)
+					}
 				} else {
 					// Use default profile from config
 					outputPath, err = rt.ProcessFile(inputPath)
@@ -624,12 +680,13 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 				rtElapsed := time.Since(rtStart)
 
 				results <- processResult{
-					index:      job.index,
-					rawFile:    job.rawFile,
-					outputPath: outputPath,
-					dngPath:    dngPath,
-					elapsed:    rtElapsed,
-					err:        err,
+					index:       job.index,
+					rawFile:     job.rawFile,
+					outputPath:  outputPath,
+					dngPath:     dngPath,
+					elapsed:     rtElapsed,
+					err:         err,
+					dngAttempts: dngAttempts,
 				}
 			}
 		}(w)
@@ -657,7 +714,12 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 		totalRawProcessingTime += result.elapsed
 
 		if result.err != nil {
-			logError("[%d/%d] Failed to process %s: %v", processedCount, len(newRAWFiles), result.rawFile.Name, result.err)
+			if result.dngAttempts > 1 {
+				logError("[%d/%d] Failed to process %s after %d DNG conversion attempts: %v",
+					processedCount, len(newRAWFiles), result.rawFile.Name, result.dngAttempts, result.err)
+			} else {
+				logError("[%d/%d] Failed to process %s: %v", processedCount, len(newRAWFiles), result.rawFile.Name, result.err)
+			}
 			continue
 		}
 
@@ -668,7 +730,13 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			dngFilesToCleanup = append(dngFilesToCleanup, result.dngPath)
 		}
 
-		logSuccess("[%d/%d] Created: %s (%.1fs)", processedCount, len(newRAWFiles), filepath.Base(result.outputPath), result.elapsed.Seconds())
+		// Show retry info if DNG conversion required retries
+		if result.dngAttempts > 1 {
+			logSuccess("[%d/%d] Created: %s (%.1fs, DNG conversion succeeded on attempt %d)",
+				processedCount, len(newRAWFiles), filepath.Base(result.outputPath), result.elapsed.Seconds(), result.dngAttempts)
+		} else {
+			logSuccess("[%d/%d] Created: %s (%.1fs)", processedCount, len(newRAWFiles), filepath.Base(result.outputPath), result.elapsed.Seconds())
+		}
 
 		// Find matching camera JPG if enabled
 		if cfg.UploadCameraJPGs {
@@ -680,8 +748,9 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			}
 		}
 
-		// Mark as processed
-		appState.MarkProcessed(result.rawFile.Name, profileName, result.outputPath)
+		// Update high-water mark with file's actual modification time
+		fileModTime := time.Unix(result.rawFile.ModTime, 0)
+		appState.MarkProcessed(fileModTime)
 	}
 
 	// Log total processing time
@@ -814,9 +883,9 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
 	logInfo("RAW processing disabled - uploading JPG files only")
 
-	// Filter unprocessed JPG files
-	processedMap := appState.GetProcessedFilesMap()
-	newJPGFiles := scanner.FilterNewFiles(scanResult.JPGFiles, processedMap)
+	// Filter unprocessed JPG files using time-based high-water mark
+	lastProcessedTime := appState.GetLastProcessedTime()
+	newJPGFiles := scanner.FilterNewFilesWithTime(scanResult.JPGFiles, nil, lastProcessedTime)
 
 	if len(newJPGFiles) == 0 {
 		logSuccess("No new JPG files to upload!")
@@ -854,8 +923,9 @@ func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scann
 			logSuccess("Uploaded: %s", jpgFile.Name)
 		}
 
-		// Mark as processed (use "jpg-only" as profile name)
-		appState.MarkProcessed(jpgFile.Name, "jpg-only", jpgFile.Path)
+		// Update high-water mark with file's actual modification time
+		fileModTime := time.Unix(jpgFile.ModTime, 0)
+		appState.MarkProcessed(fileModTime)
 	}
 
 	// Save state
@@ -1067,6 +1137,14 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 	if profilePath != "" {
 		cfg.PP3ProfilePath = profilePath
 	}
+	if skipUpload {
+		cfg.SkipUpload = true
+	}
+
+	// Check required external tools
+	if err := checkRequiredTools(cfg); err != nil {
+		log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+	}
 
 	// Find camera drive
 	fmt.Printf("Searching for drive '%s'...\n", cfg.DriveLabel)
@@ -1108,6 +1186,8 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 			Workers:            cfg.Workers,
 			UploadCameraJPGs:   cfg.UploadCameraJPGs,
 			PP3BWProfilePath:   cfg.PP3BWProfilePath,
+			ToneFormulaPath:    cfg.ToneFormulaPath,
+			ApplyToneFormula:   cfg.ApplyToneFormula,
 			ImmichServerURL:    cfg.ImmichServerURL,
 			ImmichAPIKey:       cfg.ImmichAPIKey,
 			ImmichAlbum:        cfg.ImmichAlbum,
@@ -1135,4 +1215,113 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 	if err := srv.Start(addr); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
+}
+
+
+// checkRequiredTools verifies that all required external tools are available
+func checkRequiredTools(cfg *config.Config) error {
+	var missing []string
+	var warnings []string
+
+	// Check exiftool (required for reading EXIF from RAW files)
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		missing = append(missing, "exiftool - Download from https://exiftool.org/")
+	}
+
+	// Check RawTherapee (required for RAW processing)
+	if cfg.ProcessRAWFiles {
+		rtPath := cfg.RawTherapeeExecutable
+		if rtPath == "" {
+			// Try to find it
+			names := []string{"rawtherapee-cli", "rawtherapee-cli.exe"}
+			found := false
+			for _, name := range names {
+				if _, err := exec.LookPath(name); err == nil {
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Check common installation paths
+				commonPaths := []string{
+					"C:\\Program Files\\RawTherapee\\rawtherapee-cli.exe",
+					"/Applications/RawTherapee.app/Contents/MacOS/rawtherapee-cli",
+					"/usr/bin/rawtherapee-cli",
+				}
+				for _, p := range commonPaths {
+					if _, err := os.Stat(p); err == nil {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				missing = append(missing, "rawtherapee-cli - Download from https://rawtherapee.com/")
+			}
+		} else if _, err := os.Stat(rtPath); err != nil {
+			missing = append(missing, fmt.Sprintf("rawtherapee-cli (configured path not found: %s)", rtPath))
+		}
+	}
+
+	// Check Adobe DNG Converter (required only if convert_to_dng is enabled)
+	if cfg.ConvertToDNG {
+		dngPath := cfg.DNGConverterPath
+		if dngPath == "" {
+			// Try common paths
+			commonPaths := []string{
+				"C:\\Program Files\\Adobe\\Adobe DNG Converter\\Adobe DNG Converter.exe",
+				"/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter",
+			}
+			found := false
+			for _, p := range commonPaths {
+				if _, err := os.Stat(p); err == nil {
+					found = true
+					break
+				}
+			}
+			if !found {
+				missing = append(missing, "Adobe DNG Converter - Download from https://www.adobe.com/support/downloads/dng/dng_converter.html")
+			}
+		} else if _, err := os.Stat(dngPath); err != nil {
+			missing = append(missing, fmt.Sprintf("Adobe DNG Converter (configured path not found: %s)", dngPath))
+		}
+	}
+
+	// Check immich-go (required for uploading, unless skip-upload is set)
+	if !cfg.SkipUpload {
+		imPath := cfg.ImmichExecutable
+		if imPath == "" {
+			names := []string{"immich-go", "immich-go.exe"}
+			found := false
+			for _, name := range names {
+				if _, err := exec.LookPath(name); err == nil {
+					found = true
+					break
+				}
+			}
+			if !found {
+				warnings = append(warnings, "immich-go not found - Install with: go install github.com/simulot/immich-go@latest")
+			}
+		} else if _, err := os.Stat(imPath); err != nil {
+			warnings = append(warnings, fmt.Sprintf("immich-go (configured path not found: %s)", imPath))
+		}
+	}
+
+	// Report results
+	if len(warnings) > 0 {
+		fmt.Println("\n⚠️  Warnings:")
+		for _, w := range warnings {
+			fmt.Printf("   • %s\n", w)
+		}
+	}
+
+	if len(missing) > 0 {
+		fmt.Println("\n❌ Missing required tools:")
+		for _, m := range missing {
+			fmt.Printf("   • %s\n", m)
+		}
+		return fmt.Errorf("missing %d required tool(s)", len(missing))
+	}
+
+	return nil
 }

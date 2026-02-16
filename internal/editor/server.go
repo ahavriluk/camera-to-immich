@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	customexif "github.com/ohavrylyuk/camera-to-immich/internal/exif"
 	"github.com/ohavrylyuk/camera-to-immich/internal/processor"
 	"github.com/ohavrylyuk/camera-to-immich/internal/scanner"
 	"github.com/ohavrylyuk/camera-to-immich/internal/state"
@@ -41,7 +42,8 @@ type ImageInfo struct {
 	ThumbnailURL string `json:"thumbnailUrl"`
 	IsRAW        bool   `json:"isRaw"`
 	Size         int64  `json:"size"`
-	ModTime      int64  `json:"modTime"`
+	ModTime      int64  `json:"modTime"`      // File modification time (for display)
+	CaptureTime  int64  `json:"captureTime"`  // EXIF capture time (for filtering/sorting)
 }
 
 // EditData represents edit settings for a single image
@@ -86,6 +88,9 @@ type Server struct {
 
 	// Processing config
 	processConfig ProcessConfig
+
+	// Tone calibration (for OM-3 cameras)
+	toneCalibration *processor.ToneCalibration
 }
 
 // ProcessConfig contains configuration for RAW processing
@@ -100,6 +105,10 @@ type ProcessConfig struct {
 
 	// B&W detection and processing
 	PP3BWProfilePath string // Path to B&W PP3 profile (optional)
+
+	// Tone calibration (for OM-3 cameras)
+	ToneFormulaPath  string // Path to tone formula JSON
+	ApplyToneFormula bool   // Apply tone formula based on sidecar JPEG EXIF
 
 	// Immich config for uploads
 	ImmichServerURL    string   // Immich server URL
@@ -151,6 +160,17 @@ func NewServer(config ServerConfig) (*Server, error) {
 	// Ensure output directory exists
 	if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// Initialize tone calibration if enabled
+	if config.ProcessConfig.ApplyToneFormula && config.ProcessConfig.ToneFormulaPath != "" {
+		tc, err := processor.NewToneCalibrationForWorkflow(config.ProcessConfig.ToneFormulaPath)
+		if err != nil {
+			log.Printf("Note: Failed to initialize tone calibration: %v (continuing without)", err)
+		} else {
+			s.toneCalibration = tc
+			log.Printf("Tone calibration enabled (formula: %s)", filepath.Base(config.ProcessConfig.ToneFormulaPath))
+		}
 	}
 
 	// Scan for images
@@ -208,48 +228,12 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 		filesOnCard[f.Name] = true
 	}
 
-	// Load state and find the modification time of the last processed file
+	// Load state and get the last processed file time (high-water mark)
 	var lastProcessedFileModTime time.Time
-	var processedFilenames map[string]bool
 	if s.processConfig.StatePath != "" {
 		appState, err := state.Load(s.processConfig.StatePath)
 		if err == nil {
-			log.Printf("Loaded state with %d processed files", appState.GetProcessedCount())
-
-			// Get list of processed filenames
-			processedFilenames = appState.GetProcessedFilesMap()
-
-			// Check if we have a stored LastProcessedFileTime
 			lastProcessedFileModTime = appState.GetLastProcessedTime()
-
-			// If not, find the max mod time from processed files that are still on card
-			if lastProcessedFileModTime.IsZero() && len(processedFilenames) > 0 {
-				// Build a map of filename -> mod time from scan results
-				fileModTimes := make(map[string]int64)
-				for _, f := range result.RAWFiles {
-					fileModTimes[f.Name] = f.ModTime
-				}
-				for _, f := range result.JPGFiles {
-					fileModTimes[f.Name] = f.ModTime
-				}
-
-				// Find the latest mod time among processed files
-				for filename := range processedFilenames {
-					if modTime, exists := fileModTimes[filename]; exists {
-						fileTime := time.Unix(modTime, 0)
-						if fileTime.After(lastProcessedFileModTime) {
-							lastProcessedFileModTime = fileTime
-						}
-					}
-				}
-
-				if !lastProcessedFileModTime.IsZero() {
-					log.Printf("Derived last processed file mod time from card: %s", lastProcessedFileModTime.Format("2006-01-02 15:04:05"))
-					// Update state with this derived time
-					appState.UpdateLastProcessedTime(lastProcessedFileModTime)
-					appState.Save()
-				}
-			}
 
 			if !lastProcessedFileModTime.IsZero() {
 				log.Printf("Last processed file time: %s", lastProcessedFileModTime.Format("2006-01-02 15:04:05"))
@@ -265,33 +249,78 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 		log.Printf("No state path configured")
 	}
 
-	// Filter out already-processed RAW files (by modification time)
-	// Files with mod time <= lastProcessedFileModTime are considered processed
-	rawFiles := make([]scanner.FileInfo, 0, len(result.RAWFiles))
-	filteredCount := 0
+	// Two-stage filtering for performance:
+	// Stage 1: Pre-filter by file ModTime (fast - no EXIF reading needed)
+	// Stage 2: For candidates, load EXIF CaptureTime and do final filter
+
+	// Stage 1: Pre-filter RAW files by ModTime
+	rawCandidates := make([]scanner.FileInfo, 0)
+	modTimeFilteredCount := 0
 	for _, f := range result.RAWFiles {
-		fileTime := time.Unix(f.ModTime, 0)
-		if !lastProcessedFileModTime.IsZero() && !fileTime.After(lastProcessedFileModTime) {
-			// Skip file - it's older or same as last processed time
-			filteredCount++
+		// Pre-filter by file modification time (fast)
+		fileModTime := time.Unix(f.ModTime, 0)
+		if !lastProcessedFileModTime.IsZero() && !fileModTime.After(lastProcessedFileModTime) {
+			modTimeFilteredCount++
 			continue
 		}
-		rawFiles = append(rawFiles, f)
+		rawCandidates = append(rawCandidates, f)
 	}
 
-	// Filter out already-processed JPG files (by modification time)
-	jpgFiles := make([]scanner.FileInfo, 0, len(result.JPGFiles))
+	// Stage 1: Pre-filter JPG files by ModTime
+	jpgCandidates := make([]scanner.FileInfo, 0)
 	for _, f := range result.JPGFiles {
-		fileTime := time.Unix(f.ModTime, 0)
-		if !lastProcessedFileModTime.IsZero() && !fileTime.After(lastProcessedFileModTime) {
-			// Skip file - it's older or same as last processed time
-			filteredCount++
+		// Pre-filter by file modification time (fast)
+		fileModTime := time.Unix(f.ModTime, 0)
+		if !lastProcessedFileModTime.IsZero() && !fileModTime.After(lastProcessedFileModTime) {
+			modTimeFilteredCount++
 			continue
 		}
-		jpgFiles = append(jpgFiles, f)
+		jpgCandidates = append(jpgCandidates, f)
 	}
 
-	totalFound := len(result.RAWFiles) + len(result.JPGFiles)
+	log.Printf("Pre-filter (by ModTime): %d files filtered, %d RAW + %d JPG candidates remain",
+		modTimeFilteredCount, len(rawCandidates), len(jpgCandidates))
+
+	// Stage 2: Load EXIF CaptureTime for candidates and do final filter
+	// This is the expensive part, but only runs on ~20 candidates instead of ~4600 files
+	rawFiles := make([]scanner.FileInfo, 0, len(rawCandidates))
+	exifFilteredCount := 0
+	for i := range rawCandidates {
+		f := &rawCandidates[i]
+		// Load EXIF CaptureTime for this candidate
+		captureTime := customexif.GetDateTimeOriginalWithFallback(f.Path)
+		f.CaptureTime = captureTime.Unix()
+
+		// Final filter by EXIF capture time
+		if !lastProcessedFileModTime.IsZero() && !captureTime.After(lastProcessedFileModTime) {
+			exifFilteredCount++
+			continue
+		}
+		rawFiles = append(rawFiles, *f)
+	}
+
+	// Stage 2: Same for JPG files
+	jpgFiles := make([]scanner.FileInfo, 0, len(jpgCandidates))
+	for i := range jpgCandidates {
+		f := &jpgCandidates[i]
+		// Load EXIF CaptureTime for this candidate
+		captureTime := customexif.GetDateTimeOriginalWithFallback(f.Path)
+		f.CaptureTime = captureTime.Unix()
+
+		// Final filter by EXIF capture time
+		if !lastProcessedFileModTime.IsZero() && !captureTime.After(lastProcessedFileModTime) {
+			exifFilteredCount++
+			continue
+		}
+		jpgFiles = append(jpgFiles, *f)
+	}
+
+	filteredCount := modTimeFilteredCount + exifFilteredCount
+	if exifFilteredCount > 0 {
+		log.Printf("EXIF filter: %d additional files filtered (had ModTime > high-water but CaptureTime <= high-water)",
+			exifFilteredCount)
+	}
+
 	newFilesCount := len(rawFiles) + len(jpgFiles)
 	if filteredCount > 0 {
 		log.Printf("Filtered %d already-processed files (by time), %d new files to review",
@@ -323,6 +352,7 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 			IsRAW:        true,
 			Size:         f.Size,
 			ModTime:      f.ModTime,
+			CaptureTime:  f.CaptureTime,
 		})
 	}
 
@@ -348,6 +378,7 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 					IsRAW:        false,
 					Size:         f.Size,
 					ModTime:      f.ModTime,
+					CaptureTime:  f.CaptureTime,
 				})
 			}
 		}
@@ -360,9 +391,8 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 		}
 	}
 
-	totalFound = len(result.RAWFiles) + len(result.JPGFiles)
-	if limit > 0 && totalFound > limit {
-		log.Printf("Loaded %d of %d images (limit: %d), %d have JPG sidecars for fast preview", len(s.images), totalFound, limit, sidecarCount)
+	if limit > 0 && newFilesCount > limit {
+		log.Printf("Loaded %d of %d new images (limit: %d), %d have JPG sidecars for fast preview", len(s.images), newFilesCount, limit, sidecarCount)
 	} else {
 		log.Printf("Found %d images (%d RAW, %d standalone JPG), %d RAW files have JPG sidecars", len(s.images), len(rawFiles), len(s.images)-len(rawFiles), sidecarCount)
 	}
@@ -1763,40 +1793,25 @@ func (s *Server) handleProcess(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("Failed to load state: %v", err)
 		} else {
-			// Find the latest (newest) file modification time among processed files
-			var latestModTime time.Time
+			// Find the latest (newest) EXIF capture time among processed files
+			var latestCaptureTime time.Time
 			for _, img := range imagesToProcess {
-				fileModTime := time.Unix(img.ModTime, 0)
-				if fileModTime.After(latestModTime) {
-					latestModTime = fileModTime
+				fileCaptureTime := time.Unix(img.CaptureTime, 0)
+				if fileCaptureTime.After(latestCaptureTime) {
+					latestCaptureTime = fileCaptureTime
 				}
 			}
 
-			// Update the high-water mark for processed file time
-			if !latestModTime.IsZero() {
-				appState.UpdateLastProcessedTime(latestModTime)
-				log.Printf("Updated last processed file time to: %s", latestModTime.Format("2006-01-02 15:04:05"))
-			}
-
-			// Also mark individual files (for detailed tracking/debugging)
-			for _, img := range imagesToProcess {
-				fileModTime := time.Unix(img.ModTime, 0)
-				appState.MarkProcessedWithTime(img.Filename, profileName, fileModTime)
-			}
-
-			// Clear old individual file entries to keep state file small
-			// Only keep the last batch for reference
-			appState.ProcessedFiles = make(map[string]state.ProcessedFile)
-			for _, img := range imagesToProcess {
-				fileModTime := time.Unix(img.ModTime, 0)
-				appState.MarkProcessedWithTime(img.Filename, profileName, fileModTime)
+			// Update the high-water mark for processed file time (based on EXIF capture time)
+			if !latestCaptureTime.IsZero() {
+				appState.UpdateLastProcessedTime(latestCaptureTime)
+				log.Printf("Updated last processed file time to: %s (EXIF capture time)", latestCaptureTime.Format("2006-01-02 15:04:05"))
 			}
 
 			if err := appState.Save(); err != nil {
 				log.Printf("Failed to save state: %v", err)
 			} else {
-				log.Printf("State updated: marked %d files as processed, last file time: %s",
-					len(imagesToProcess), latestModTime.Format("2006-01-02 15:04:05"))
+				log.Printf("State updated: last capture time: %s", latestCaptureTime.Format("2006-01-02 15:04:05"))
 			}
 		}
 	}
@@ -2160,6 +2175,26 @@ ExifKeys=Exif.Image.Artist;Exif.Image.Copyright;Exif.Image.ImageDescription;Exif
 		imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
 		if err != nil {
 			log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+		}
+	}
+
+	// Apply tone calibration if enabled and sidecar JPEG exists
+	if s.toneCalibration != nil {
+		sidecarPath := s.toneCalibration.FindSidecarJPEG(img.Path)
+		if sidecarPath != "" {
+			// Extract tone settings from sidecar JPEG
+			om3Settings, toneErr := s.toneCalibration.ExtractToneSettings(sidecarPath)
+			if toneErr == nil {
+				// Calculate ToneEqualizer settings from formula
+				teSettings := s.toneCalibration.CalculateFromFormula(om3Settings)
+				// Apply ToneEqualizer to base profile
+				baseProfile = s.toneCalibration.GeneratePP3WithToneEqualizer(teSettings, baseProfile)
+				log.Printf("Applied tone calibration for %s: H=%d S=%d M=%d C=%d -> Band0=%d Band1=%d Band2=%d Band3=%d Band4=%d",
+					img.Filename, om3Settings.Highlights, om3Settings.Shadows, om3Settings.Midtones, om3Settings.Contrast,
+					teSettings.Band0, teSettings.Band1, teSettings.Band2, teSettings.Band3, teSettings.Band4)
+			} else {
+				log.Printf("Note: Failed to extract tone settings for %s: %v", img.Filename, toneErr)
+			}
 		}
 	}
 
