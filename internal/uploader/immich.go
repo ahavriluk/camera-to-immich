@@ -1,22 +1,28 @@
 package uploader
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // ImmichConfig contains configuration for Immich uploads
 type ImmichConfig struct {
-	ExecutablePath string   // Path to immich-go executable
-	ServerURL      string   // Immich server URL
-	APIKey         string   // Immich API key
-	Album          string   // Optional album name
-	Tags           []string // Tags to apply to uploads
-	ShowProgress   bool     // Show upload progress (stream immich-go output)
+	ExecutablePath string        // Path to immich-go executable
+	ServerURL      string        // Immich server URL
+	APIKey         string        // Immich API key
+	Album          string        // Optional album name
+	Tags           []string      // Tags to apply to uploads
+	ShowProgress   bool          // Show upload progress (stream immich-go output)
+	MaxRetries     int           // Maximum number of retry attempts (0 = no retry)
+	RetryDelay     time.Duration // Initial delay between retries (will increase exponentially)
 }
 
 // Immich handles uploading files to Immich server
@@ -112,16 +118,100 @@ func (im *Immich) UploadFolder(folderPath string, additionalTags []string, recur
 	return im.uploadDirectory(folderPath, additionalTags, recursive)
 }
 
-// uploadDirectory performs the actual upload of a directory
+// uploadDirectory performs the actual upload of a directory with retry logic
 func (im *Immich) uploadDirectory(dirPath string, additionalTags []string, recursive bool) error {
+	// Set defaults for retry
+	maxRetries := im.config.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = 3 // Default to 3 retries
+	}
+	retryDelay := im.config.RetryDelay
+	if retryDelay == 0 {
+		retryDelay = 5 * time.Second // Default initial delay
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 5s, 10s, 20s, 40s...
+			delay := retryDelay * time.Duration(1<<(attempt-1))
+			log.Printf("Upload failed, retrying in %v (attempt %d/%d)...", delay, attempt, maxRetries)
+			time.Sleep(delay)
+		}
+
+		err := im.doUpload(dirPath, additionalTags, recursive)
+		if err == nil {
+			if attempt > 0 {
+				log.Printf("Upload succeeded after %d retries", attempt)
+			}
+			return nil
+		}
+		lastErr = err
+		
+		// Check if error is retryable (network errors, timeouts)
+		if !isRetryableError(err) {
+			return err
+		}
+	}
+
+	return fmt.Errorf("upload failed after %d attempts: %v", maxRetries+1, lastErr)
+}
+
+// isRetryableError checks if an error is likely to be transient and worth retrying
+func isRetryableError(err error) bool {
+	errStr := err.Error()
+	retryablePatterns := []string{
+		"no such host",
+		"connection refused",
+		"connection reset",
+		"timeout",
+		"temporary failure",
+		"network is unreachable",
+		"dial tcp",
+		"EOF",
+		"broken pipe",
+	}
+	for _, pattern := range retryablePatterns {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectNetworkError checks output for network-related errors and returns an error if found
+func detectNetworkError(output string) error {
+	networkPatterns := []string{
+		"no such host",
+		"connection refused",
+		"connection reset",
+		"timeout",
+		"temporary failure",
+		"network is unreachable",
+		"dial tcp",
+		"broken pipe",
+		"server error",
+	}
+	
+	outputLower := strings.ToLower(output)
+	for _, pattern := range networkPatterns {
+		if strings.Contains(outputLower, pattern) {
+			return errors.New("network error detected: " + pattern)
+		}
+	}
+	return nil
+}
+
+// doUpload performs the actual upload without retry logic
+func (im *Immich) doUpload(dirPath string, additionalTags []string, recursive bool) error {
 	// Build command arguments using new immich-go CLI syntax:
 	// immich-go upload from-folder --server URL --api-key KEY [--tag TAG]... FOLDER
+	// Note: We don't use --on-errors continue so that errors cause immediate failure and trigger retry
 	args := []string{
 		"upload",
 		"from-folder",
 		"--server", im.config.ServerURL,
 		"--api-key", im.config.APIKey,
-		"--on-errors", "continue",      // Continue on errors
 		"--skip-verify-ssl",            // Skip SSL verification (faster handshake)
 	}
 
@@ -149,22 +239,39 @@ func (im *Immich) uploadDirectory(dirPath string, additionalTags []string, recur
 	// Add the folder path
 	args = append(args, dirPath)
 
-	// Execute immich-go
+	// Execute immich-go and capture output to detect errors
 	cmd := exec.Command(im.config.ExecutablePath, args...)
 	
+	// We need to capture output even when showing progress to detect errors
+	var outputBuf strings.Builder
+	
 	if im.config.ShowProgress {
-		// Stream output to console in real-time for progress display
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		// Create a tee writer to both display and capture output
+		cmd.Stdout = io.MultiWriter(os.Stdout, &outputBuf)
+		cmd.Stderr = io.MultiWriter(os.Stderr, &outputBuf)
 		err := cmd.Run()
+		output := outputBuf.String()
+		
+		// Check for network errors in output even if exit code is 0
+		if networkErr := detectNetworkError(output); networkErr != nil {
+			return networkErr
+		}
+		
 		if err != nil {
 			return fmt.Errorf("immich-go upload failed: %v", err)
 		}
 	} else {
 		// Capture output (no progress display)
 		output, err := cmd.CombinedOutput()
+		outputStr := string(output)
+		
+		// Check for network errors in output even if exit code is 0
+		if networkErr := detectNetworkError(outputStr); networkErr != nil {
+			return networkErr
+		}
+		
 		if err != nil {
-			return fmt.Errorf("immich-go upload failed: %v\nOutput: %s", err, string(output))
+			return fmt.Errorf("immich-go upload failed: %v\nOutput: %s", err, outputStr)
 		}
 	}
 

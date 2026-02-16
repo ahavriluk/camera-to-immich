@@ -37,11 +37,16 @@ Configure the `raw_extensions` option to specify which formats to process.
    - Windows: [Download from rawtherapee.com](https://rawtherapee.com/)
    - macOS: `brew install rawtherapee` or download from website
 
-2. **immich-go** CLI tool
+2. **ExifTool** (for reading EXIF metadata from RAW files)
+   - Windows: [Download from exiftool.org](https://exiftool.org/) - extract and add to PATH
+   - macOS: `brew install exiftool`
+   - Linux: `sudo apt install libimage-exiftool-perl` or `sudo dnf install perl-Image-ExifTool`
+
+3. **immich-go** CLI tool
    - Install: `go install github.com/simulot/immich-go@latest`
    - Or download from [GitHub releases](https://github.com/simulot/immich-go/releases)
 
-3. **Go 1.21+** (for building from source)
+4. **Go 1.21+** (for building from source)
    - [Download from go.dev](https://go.dev/dl/)
 
 ## Installation
@@ -95,6 +100,7 @@ This creates a sample configuration file at:
   "cleanup_dng_files": true,
   "rawtherapee_executable": "",
   "pp3_profile_path": "/path/to/your/profile.pp3",
+  "pp3_bw_profile_path": "/path/to/your/bw-profile.pp3",
   "jpeg_quality": 92,
   "output_directory": "/path/to/output",
   "immich_executable": "",
@@ -124,9 +130,12 @@ This creates a sample configuration file at:
 | `dng_embed_original` | Embed original RAW in DNG (larger files) | `false` |
 | `cleanup_dng_files` | Delete intermediate DNG files after processing | `true` |
 | `rawtherapee_executable` | Path to rawtherapee-cli (auto-detected if empty) | Auto |
-| `pp3_profile_path` | Path to your PP3 processing profile | Required (if processing RAW) |
+| `pp3_profile_path` | Path to your PP3 processing profile (for color images) | Required (if processing RAW) |
+| `pp3_bw_profile_path` | Path to your B&W PP3 profile (optional, for B&W detection) | None |
 | `jpeg_quality` | Output JPEG quality (1-100) | `92` |
 | `output_directory` | Where to save processed JPEGs | `~/.camera-to-immich/output` |
+| `tone_formula_path` | Path to tone calibration formula JSON (from tone-calibrator) | None |
+| `apply_tone_formula` | Apply tone formula based on camera JPEG EXIF settings (uses `pp3_profile_path` as base) | `false` |
 | `immich_executable` | Path to immich-go (auto-detected if empty) | Auto |
 | `immich_server_url` | Your Immich server URL | Required |
 | `immich_api_key` | Your Immich API key | Required |
@@ -213,6 +222,126 @@ Some newer cameras (like the OM System OM-3) may not be natively supported by Ra
 - The DNG file may have slightly different characteristics than the original RAW
 - Test with a few files first to ensure your profile produces the desired results
 
+### B&W Detection for Camera B&W Shots
+
+When shooting in B&W mode on your camera, the JPG sidecar file is grayscale but the RAW file still contains full color data. The tool can automatically detect B&W images from the sidecar JPG and handle them specially:
+
+**How it works:**
+1. When processing images, the tool analyzes the sidecar JPG (camera-generated JPG)
+2. If ~95% of pixels are grayscale (R≈G≈B), the image is detected as B&W
+3. If `pp3_bw_profile_path` is configured and exists, the B&W profile is used to process the RAW
+4. If no B&W profile is configured, the sidecar JPG is uploaded instead (preserving the camera's B&W processing)
+5. B&W images are tagged with `b&w` tag for easy filtering in Immich
+
+**Configuration for B&W detection:**
+```json
+{
+  "pp3_profile_path": "/path/to/color/profile.pp3",
+  "pp3_bw_profile_path": "/path/to/bw/profile.pp3"
+}
+```
+
+**Tagging behavior:**
+- B&W processed images get: `b&w`, `processed`, `profile:YourBWProfileName`
+- B&W sidecar-only images get: `b&w`, `camera-original`
+- Color processed images get: `processed`, `profile:YourColorProfileName`
+
+This feature is useful for photographers who:
+- Shoot in B&W mode in-camera for creative preview
+- Want to use a dedicated B&W processing profile for their RAW files
+- Want to preserve the camera's B&W processing when no custom profile is available
+
+### Tone Calibration for OM System Cameras
+
+OM System cameras (OM-3, OM-1, etc.) have in-camera tone adjustments (Highlights, Shadows, Midtones, Contrast) that affect the camera-generated JPEG. When shooting RAW+JPEG, these settings are stored in the JPEG EXIF data. The tone calibration feature automatically applies matching adjustments to your RAW processing, so your processed JPEGs match the camera's rendering.
+
+**How it works:**
+1. A calibration tool analyzes RAW+JPEG pairs to learn how camera settings map to RawTherapee's ToneEqualizer
+2. Linear regression generates a formula file (`tone_formula.json`) with coefficients for each ToneEqualizer band
+3. During processing, the tool reads the sidecar JPEG's EXIF data and generates a custom PP3 profile
+4. The custom profile applies the ToneEqualizer settings matching your in-camera tone choices
+
+**Step 1: Generate the Calibration Formula**
+
+Run the tone calibrator on a set of RAW+JPEG pairs (minimum 20+ recommended):
+
+```bash
+# Build the calibrator
+go build -o tone-calibrator.exe ./cmd/tone-calibrator
+
+# Run calibration on your camera card with a base PP3 profile
+tone-calibrator -source "E:\DCIM\100OMSYS" -formula tone_formula.json -base-pp3 "C:\path\to\your\base-profile.pp3"
+
+# Example with DNG conversion (for cameras not supported by RawTherapee)
+tone-calibrator -source "E:\DCIM\100OMSYS" -formula tone_formula.json -base-pp3 "C:\path\to\base.pp3" -dng
+
+# Apply formula to a single RAW file (test mode)
+tone-calibrator -apply "E:\DCIM\100OMSYS\P1193660.ORF" -formula tone_formula.json -base-pp3 "C:\path\to\base.pp3"
+
+# Command line options:
+#   -source    Directory containing ORF+JPG pairs (required for calibration)
+#   -formula   Output/input formula JSON file
+#   -base-pp3  Base PP3 profile to overlay ToneEqualizer settings (required)
+#   -dng       Use ORF → DNG → JPG workflow (for cameras not supported by RawTherapee)
+#   -start     Start from file containing this substring (to resume calibration)
+#   -limit     Limit number of samples to process
+#   -apply     Apply formula to a single RAW file (test mode)
+#   -out       Output JPG path for -apply mode (default: same directory as input)
+```
+
+The calibrator outputs accuracy metrics:
+- **R²** (0-1): How well the formula fits the data (>0.8 is good)
+- **RMSE**: Average error in ToneEqualizer units
+- **Mean Error**: Average prediction error per band
+
+**Step 2: Configure camera-to-immich**
+
+Add tone calibration settings to your config.json:
+
+```json
+{
+  "apply_tone_formula": true,
+  "tone_formula_path": "C:/Users/YourName/.camera-to-immich/tone_formula.json"
+}
+```
+
+| Option | Description |
+|--------|-------------|
+| `apply_tone_formula` | Enable automatic tone matching |
+| `tone_formula_path` | Path to the calibration formula JSON |
+
+The `pp3_profile_path` is used as the base profile for the ToneEqualizer overlay.
+
+**Step 3: Process as usual**
+
+When running camera-to-immich, the tool will automatically:
+1. Find the sidecar JPEG for each RAW file
+2. Extract EXIF tone settings (Highlights, Shadows, Midtones, Contrast)
+3. Calculate ToneEqualizer band values using the formula
+4. Generate a temporary PP3 with your base profile (`pp3_profile_path`) + ToneEqualizer settings
+5. Process the RAW with the customized profile
+
+**OM System EXIF Tags Used:**
+- `ToneLevel` - Contains H (Highlights), S (Shadows), M (Midtones) values (-7 to +7)
+- `PictureModeContrast` - Contrast adjustment (-2 to +2)
+
+**Formula File Format:**
+```json
+{
+  "bands": {
+    "Band0": {"C0": -5.2, "Highlights": 1.8, "Shadows": -0.5, "Midtones": 0.3, "Contrast": 2.1},
+    "Band1": {"C0": -3.1, "Highlights": 2.5, "Shadows": -0.8, "Midtones": 0.4, "Contrast": 1.5},
+    ...
+  },
+  "accuracy": {
+    "Band0": {"R2": 0.89, "RMSE": 4.2, "MeanError": -0.3},
+    ...
+  },
+  "sample_count": 27,
+  "created_at": "2026-02-08T12:00:00Z"
+}
+```
+
 ## Usage
 
 ### Basic Usage
@@ -249,6 +378,8 @@ Options:
   -version           Show version information
   -state-info        Show state file information and exit
   -clear-state       Clear the processed files state and exit
+  -cache-info        Show cache information (size, file count) and exit
+  -clear-cache       Clear the preview image cache and exit
 ```
 
 ### Examples
@@ -283,6 +414,12 @@ camera-to-immich -clear-state
 
 # Process with 8 parallel workers (for multi-core CPUs)
 camera-to-immich -workers 8
+
+# Check cache size (preview images from web editor)
+camera-to-immich -cache-info
+
+# Clear the preview cache to free disk space
+camera-to-immich -clear-cache
 ```
 
 ## Workflow
@@ -319,7 +456,31 @@ The tool supports parallel RAW processing to take advantage of multi-core CPUs:
 ├── config.json      # Configuration file
 ├── state.json       # Processing state (tracked files)
 └── output/          # Default output directory for processed JPEGs
+    ├── *.jpg        # Processed JPEG files (cleaned up after upload)
+    └── .cache/      # Preview image cache (from web editor)
 ```
+
+## Cache Management
+
+When using the web editor (`-editor` mode), preview images are generated and cached to improve performance. Over time, this cache can grow significantly.
+
+### Automatic Cleanup
+- Cache files for processed images are automatically cleaned up after successful processing
+- This prevents the cache from growing indefinitely during normal usage
+
+### Manual Cleanup
+- **Check cache size**: `camera-to-immich -cache-info`
+- **Clear all cache**: `camera-to-immich -clear-cache`
+
+### Web Editor API
+When the web editor is running, you can also manage the cache via the API:
+- **GET `/api/cache`** - Get cache statistics (file count, total size)
+- **DELETE `/api/cache`** - Clear all cached preview files
+
+### Cache Location
+The cache is stored in `.cache` subdirectory of your output directory:
+- Default: `~/.camera-to-immich/output/.cache/`
+- Custom: `{output_directory}/.cache/`
 
 ## Troubleshooting
 
@@ -338,6 +499,16 @@ The tool supports parallel RAW processing to take advantage of multi-core CPUs:
 
 - Install: `go install github.com/simulot/immich-go@latest`
 - Or download from GitHub and set path in config
+
+### ExifTool not found
+
+ExifTool is required for reading EXIF metadata from RAW files (ORF, CR2, NEF, etc.):
+
+- **Windows**: Download from [exiftool.org](https://exiftool.org/), extract `exiftool(-k).exe`, rename to `exiftool.exe`, and add to your PATH
+- **macOS**: `brew install exiftool`
+- **Linux**: `sudo apt install libimage-exiftool-perl` or `sudo dnf install perl-Image-ExifTool`
+
+Verify installation: `exiftool -ver` should show version number
 
 ### Upload fails
 

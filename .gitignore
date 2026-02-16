@@ -39,3 +39,7 @@ Thumbs.db
 # Config files with sensitive data (users should create their own)
 # Uncomment if you want to exclude config:
 # config.json
+
+# Tone calibration tool outputs (intermediate files)
+calibration.db
+tone_formula - v*.json
