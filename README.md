@@ -342,6 +342,66 @@ When running camera-to-immich, the tool will automatically:
 }
 ```
 
+### Grain Analyzer (Optional Tool)
+
+The grain analyzer is a standalone utility that analyzes film scans to derive RawTherapee film grain settings. This is useful when you want to add film-like grain to your digital photos that matches the characteristics of a specific film stock.
+
+**Use Case:**
+- You have scanned film photos and want to replicate that grain look on digital images
+- You want to create custom film grain profiles for RawTherapee based on actual film characteristics
+
+**Build the tool:**
+
+```bash
+go build -o grain-analyzer.exe ./cmd/grain-analyzer  # Windows
+go build -o grain-analyzer ./cmd/grain-analyzer       # macOS/Linux
+```
+
+**Usage:**
+
+```bash
+# Analyze a directory of film scans
+grain-analyzer -source "C:\path\to\film\scans"
+
+# Analyze with a specific sample size
+grain-analyzer -source "C:\path\to\film\scans" -samples 10
+```
+
+**Command-line Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-source` | Directory containing film scans (JPG/PNG) | Required |
+| `-samples` | Number of images to analyze | `5` |
+
+**Output:**
+
+The tool analyzes the grain characteristics of your film scans and outputs recommended RawTherapee Film Grain settings:
+
+```
+RECOMMENDED RAWTHERAPEE FILM GRAIN SETTINGS
+==================================================
+
+[Film Grain]
+Enabled=true
+ISO=200
+Strength=25
+Scale=85
+```
+
+**Metrics Analyzed:**
+- **Std Dev (grain indicator)**: Correlates with grain visibility
+- **Local Variance**: Indicates grain texture intensity
+- **High Freq Energy**: Indicates grain size/coarseness
+
+**Applying the Settings:**
+
+1. Open RawTherapee
+2. Go to the **Detail** tab → **Film Grain**
+3. Enable Film Grain
+4. Enter the suggested ISO, Strength, and Scale values
+5. Save as a PP3 profile for reuse
+
 ## Usage
 
 ### Basic Usage
