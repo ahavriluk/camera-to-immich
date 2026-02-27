@@ -223,6 +223,54 @@ function updateStats() {
     document.getElementById('edited-count').textContent = editedCount;
 }
 
+// Get camera aspect ratio from current image EXIF data
+function getCameraAspectRatio() {
+    const img = state.images[state.currentIndex];
+    if (!img || !img.aspectRatio) {
+        return 4/3; // Default for OM System cameras (4:3 sensor)
+    }
+    return parseAspectRatioString(img.aspectRatio);
+}
+
+// Parse aspect ratio string like "16:9" or "3:4" into numeric ratio
+function parseAspectRatioString(ratioStr) {
+    const parts = ratioStr.split(':');
+    if (parts.length === 2) {
+        const w = parseFloat(parts[0]);
+        const h = parseFloat(parts[1]);
+        if (!isNaN(w) && !isNaN(h) && h > 0) {
+            return w / h;
+        }
+    }
+    return 4/3; // Default fallback
+}
+
+// Check if current image has a custom camera aspect ratio (non-4:3)
+function hasCustomCameraAspect() {
+    const img = state.images[state.currentIndex];
+    return img && img.aspectRatio && img.aspectRatio !== '4:3';
+}
+
+// Update camera aspect ratio UI elements
+function updateCameraAspectUI(img) {
+    const labelEl = document.getElementById('camera-aspect-label');
+    const valueEl = document.getElementById('camera-aspect-value');
+    const btnEl = document.getElementById('camera-aspect-btn');
+    
+    if (img && img.aspectRatio && img.aspectRatio !== '4:3') {
+        // Show camera aspect ratio info and button
+        labelEl.style.display = 'inline';
+        btnEl.style.display = 'inline-block';
+        valueEl.textContent = img.aspectRatio;
+        btnEl.textContent = '📷 ' + img.aspectRatio;
+        btnEl.title = 'Apply camera aspect ratio: ' + img.aspectRatio;
+    } else {
+        // Hide camera aspect ratio elements for 4:3 images
+        labelEl.style.display = 'none';
+        btnEl.style.display = 'none';
+    }
+}
+
 // Modal
 function openModal(index) {
     state.currentIndex = index;
@@ -239,24 +287,47 @@ function openModal(index) {
     document.getElementById('rotation').value = edit.rotation;
     document.getElementById('rotation-value').textContent = edit.rotation.toFixed(1) + '°';
     
+    // Update camera aspect ratio UI
+    updateCameraAspectUI(img);
+    
     updateBWToggle(edit.bw);
     updateExposurePresets(edit.exposure);
-    updateAspectButtons(edit.aspect || 'free');
-    applyPreview(edit);
     
-    // Restore crop overlay if this image has saved crop data
-    if (edit.crop) {
-        document.getElementById('crop-overlay').classList.add('active');
-        // Wait for image to load before restoring crop position
+    // If this is an untouched image with custom camera aspect ratio, auto-apply it
+    if (!edit.touched && hasCustomCameraAspect() && !edit.crop) {
+        // Auto-apply camera aspect ratio for untouched images with non-4:3 aspect
+        edit.aspect = 'camera';
+        updateAspectButtons('camera');
+        // Wait for image to load before initializing crop
         const previewImg = document.getElementById('preview-image');
         if (previewImg.complete) {
-            restoreCropArea(edit);
+            document.getElementById('crop-overlay').classList.add('active');
+            initializeCropArea('camera');
         } else {
-            previewImg.addEventListener('load', () => restoreCropArea(edit), { once: true });
+            previewImg.addEventListener('load', () => {
+                document.getElementById('crop-overlay').classList.add('active');
+                initializeCropArea('camera');
+            }, { once: true });
         }
     } else {
-        document.getElementById('crop-overlay').classList.remove('active');
+        updateAspectButtons(edit.aspect || 'free');
+        
+        // Restore crop overlay if this image has saved crop data
+        if (edit.crop) {
+            document.getElementById('crop-overlay').classList.add('active');
+            // Wait for image to load before restoring crop position
+            const previewImg = document.getElementById('preview-image');
+            if (previewImg.complete) {
+                restoreCropArea(edit);
+            } else {
+                previewImg.addEventListener('load', () => restoreCropArea(edit), { once: true });
+            }
+        } else {
+            document.getElementById('crop-overlay').classList.remove('active');
+        }
     }
+    
+    applyPreview(edit);
     
     // Show grid lines and rotation crop overlay only when rotating
     if (edit.rotation !== 0) {
@@ -508,9 +579,19 @@ function initializeCropArea(aspect) {
         '3:2': 3/2,
         '2:3': 2/3,
         '4:3': 4/3,
+        '3:4': 3/4,
         '16:9': 16/9,
+        '9:16': 9/16,
         '5:4': 5/4,
-        'original': imgAspect
+        '4:5': 4/5,
+        '7:6': 7/6,
+        '6:7': 6/7,
+        '6:5': 6/5,
+        '5:6': 5/6,
+        '7:5': 7/5,
+        '5:7': 5/7,
+        'original': imgAspect,
+        'camera': getCameraAspectRatio()  // Use EXIF aspect ratio from camera
     };
     
     const ratio = aspectRatios[aspect] || imgAspect;

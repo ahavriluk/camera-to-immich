@@ -366,6 +366,44 @@ body {
     color: var(--accent);
 }
 
+/* Camera Aspect Label */
+.camera-aspect-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    background: #2a2a2a;
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.camera-aspect-label .camera-icon {
+    font-size: 12px;
+}
+
+.camera-aspect-label.has-custom-aspect {
+    color: var(--accent);
+    background: rgba(0, 122, 255, 0.15);
+}
+
+.camera-aspect-btn {
+    padding: 4px 8px;
+    background: transparent;
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    color: inherit;
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.camera-aspect-btn:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+}
+
 /* Aspect Buttons */
 .aspect-buttons {
     display: grid;

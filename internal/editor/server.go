@@ -34,16 +34,26 @@ var templatesFS embed.FS
 
 // ImageInfo represents an image for the web editor
 type ImageInfo struct {
-	ID           string `json:"id"`
-	Filename     string `json:"filename"`
-	Path         string `json:"path"`
-	BaseName     string `json:"baseName"` // Filename without extension (for sidecar matching)
-	PreviewURL   string `json:"previewUrl"`
-	ThumbnailURL string `json:"thumbnailUrl"`
-	IsRAW        bool   `json:"isRaw"`
-	Size         int64  `json:"size"`
-	ModTime      int64  `json:"modTime"`      // File modification time (for display)
-	CaptureTime  int64  `json:"captureTime"`  // EXIF capture time (for filtering/sorting)
+	ID           string          `json:"id"`
+	Filename     string          `json:"filename"`
+	Path         string          `json:"path"`
+	BaseName     string          `json:"baseName"` // Filename without extension (for sidecar matching)
+	PreviewURL   string          `json:"previewUrl"`
+	ThumbnailURL string          `json:"thumbnailUrl"`
+	IsRAW        bool            `json:"isRaw"`
+	Size         int64           `json:"size"`
+	ModTime      int64           `json:"modTime"`           // File modification time (for display)
+	CaptureTime  int64           `json:"captureTime"`       // EXIF capture time (for filtering/sorting)
+	AspectRatio  string          `json:"aspectRatio"`       // Camera aspect ratio (e.g., "4:3", "3:2", "16:9")
+	CropFrame    *CropFrameInfo  `json:"cropFrame"`         // Optional crop frame from EXIF
+}
+
+// CropFrameInfo represents crop coordinates from camera EXIF data
+type CropFrameInfo struct {
+	X      int `json:"x"`      // Left edge
+	Y      int `json:"y"`      // Top edge
+	Width  int `json:"width"`  // Crop width
+	Height int `json:"height"` // Crop height
 }
 
 // EditData represents edit settings for a single image
@@ -342,7 +352,7 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 	// Add RAW files (primary focus for the editor)
 	// Use BaseName (without extension) as ID for stable identification across sessions
 	for _, f := range rawFiles {
-		s.images = append(s.images, ImageInfo{
+		imgInfo := ImageInfo{
 			ID:           f.BaseName, // Use basename as stable ID
 			Filename:     f.Name,
 			Path:         f.Path,
@@ -353,7 +363,22 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 			Size:         f.Size,
 			ModTime:      f.ModTime,
 			CaptureTime:  f.CaptureTime,
-		})
+		}
+		
+		// Read aspect ratio from EXIF for OM System cameras
+		if aspectInfo, err := customexif.GetAspectRatio(f.Path); err == nil && aspectInfo != nil {
+			imgInfo.AspectRatio = aspectInfo.Ratio
+			if aspectInfo.CropFrame != nil {
+				imgInfo.CropFrame = &CropFrameInfo{
+					X:      aspectInfo.CropFrame.X,
+					Y:      aspectInfo.CropFrame.Y,
+					Width:  aspectInfo.CropFrame.Width,
+					Height: aspectInfo.CropFrame.Height,
+				}
+			}
+		}
+		
+		s.images = append(s.images, imgInfo)
 	}
 
 	// Add standalone JPG files (only if no limit set, for JPG-only workflows)
@@ -2169,12 +2194,67 @@ ExifKeys=Exif.Image.Artist;Exif.Image.Copyright;Exif.Image.ImageDescription;Exif
 	}
 
 	// Get image dimensions for crop calculation
+	// IMPORTANT: For RAW files with camera aspect ratio, we need to use the EXIF RAW dimensions
+	// not the sidecar JPG dimensions (which are already cropped by the camera)
 	imgWidth, imgHeight := 0, 0
-	if edit.Crop != nil {
-		var err error
-		imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
-		if err != nil {
-			log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+	useExifCropFrameDirectly := false
+
+	// Check if this image has a non-4:3 camera aspect ratio
+	hasNon43AspectRatio := img.AspectRatio != "" && img.AspectRatio != "4:3" && img.CropFrame != nil
+
+	if edit.Crop != nil || edit.Aspect == "camera" || hasNon43AspectRatio {
+		if hasNon43AspectRatio && img.CropFrame != nil {
+			// For non-4:3 aspect ratio images, calculate RAW sensor dimensions from crop frame
+			// The crop frame defines the region within the full RAW sensor
+			// For OM-3: full sensor is 5184x3888 (approximately), crop frame X+Width gives us one boundary
+			// Use the EXIF crop frame directly for PP3 - no normalization needed
+			useExifCropFrameDirectly = true
+			// We still need dimensions for other crop operations, estimate from crop frame
+			// The crop frame represents the usable area, and X+Width or Y+Height give max bounds
+			imgWidth = img.CropFrame.X + img.CropFrame.Width
+			imgHeight = img.CropFrame.Y + img.CropFrame.Height
+			log.Printf("Using EXIF crop frame directly for %s (aspect %s): (%d,%d,%d,%d)",
+				img.Filename, img.AspectRatio, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
+		} else {
+			var err error
+			imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
+			if err != nil {
+				log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+			}
+		}
+	}
+
+	// If camera aspect ratio is selected OR image has non-4:3 aspect ratio, use EXIF crop frame
+	if (edit.Aspect == "camera" || hasNon43AspectRatio) && img.CropFrame != nil {
+		// For untouched images with non-4:3 aspect ratio, auto-apply the camera crop
+		// Don't apply if user has manually set a different crop
+		if edit.Crop == nil || (edit.Crop.X == 0 && edit.Crop.Y == 0 && edit.Crop.Width == 1 && edit.Crop.Height == 1) {
+			if useExifCropFrameDirectly {
+				// Use EXIF crop frame pixel coordinates directly
+				edit.Crop = &CropBox{
+					X:      float64(img.CropFrame.X),
+					Y:      float64(img.CropFrame.Y),
+					Width:  float64(img.CropFrame.Width),
+					Height: float64(img.CropFrame.Height),
+				}
+				// Mark that we're using pixel coordinates directly (not normalized)
+				// by setting imgWidth/imgHeight to indicate direct pixel mode
+				imgWidth = 1
+				imgHeight = 1
+				log.Printf("Applied camera aspect ratio crop for %s: using EXIF frame pixels (%d,%d,%d,%d)",
+					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
+			} else if imgWidth > 0 && imgHeight > 0 {
+				// Convert camera's EXIF crop frame to normalized crop box
+				edit.Crop = &CropBox{
+					X:      float64(img.CropFrame.X) / float64(imgWidth),
+					Y:      float64(img.CropFrame.Y) / float64(imgHeight),
+					Width:  float64(img.CropFrame.Width) / float64(imgWidth),
+					Height: float64(img.CropFrame.Height) / float64(imgHeight),
+				}
+				log.Printf("Applied camera aspect ratio crop for %s: EXIF frame (%d,%d,%d,%d) -> normalized (%.3f,%.3f,%.3f,%.3f)",
+					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
+					edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+			}
 		}
 	}
 
@@ -2225,12 +2305,58 @@ func (s *Server) generatePP3WithProfile(img *ImageInfo, edit EditData, globalPre
 	log.Printf("Using custom B&W profile: %s", filepath.Base(customProfilePath))
 
 	// Get image dimensions for crop calculation
+	// IMPORTANT: For RAW files with camera aspect ratio, we need to use the EXIF RAW dimensions
+	// not the sidecar JPG dimensions (which are already cropped by the camera)
 	imgWidth, imgHeight := 0, 0
-	if edit.Crop != nil {
-		var err error
-		imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
-		if err != nil {
-			log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+	useExifCropFrameDirectly := false
+
+	// Check if this image has a non-4:3 camera aspect ratio
+	hasNon43AspectRatio := img.AspectRatio != "" && img.AspectRatio != "4:3" && img.CropFrame != nil
+
+	if edit.Crop != nil || edit.Aspect == "camera" || hasNon43AspectRatio {
+		if hasNon43AspectRatio && img.CropFrame != nil {
+			// For non-4:3 aspect ratio images, use EXIF crop frame directly
+			useExifCropFrameDirectly = true
+			imgWidth = img.CropFrame.X + img.CropFrame.Width
+			imgHeight = img.CropFrame.Y + img.CropFrame.Height
+			log.Printf("Using EXIF crop frame directly (B&W) for %s (aspect %s): (%d,%d,%d,%d)",
+				img.Filename, img.AspectRatio, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
+		} else {
+			var err error
+			imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
+			if err != nil {
+				log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+			}
+		}
+	}
+
+	// If camera aspect ratio is selected OR image has non-4:3 aspect ratio, use EXIF crop frame
+	if (edit.Aspect == "camera" || hasNon43AspectRatio) && img.CropFrame != nil {
+		if edit.Crop == nil || (edit.Crop.X == 0 && edit.Crop.Y == 0 && edit.Crop.Width == 1 && edit.Crop.Height == 1) {
+			if useExifCropFrameDirectly {
+				// Use EXIF crop frame pixel coordinates directly
+				edit.Crop = &CropBox{
+					X:      float64(img.CropFrame.X),
+					Y:      float64(img.CropFrame.Y),
+					Width:  float64(img.CropFrame.Width),
+					Height: float64(img.CropFrame.Height),
+				}
+				imgWidth = 1
+				imgHeight = 1
+				log.Printf("Applied camera aspect ratio crop (B&W) for %s: using EXIF frame pixels (%d,%d,%d,%d)",
+					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
+			} else if imgWidth > 0 && imgHeight > 0 {
+				// Convert camera's EXIF crop frame to normalized crop box
+				edit.Crop = &CropBox{
+					X:      float64(img.CropFrame.X) / float64(imgWidth),
+					Y:      float64(img.CropFrame.Y) / float64(imgHeight),
+					Width:  float64(img.CropFrame.Width) / float64(imgWidth),
+					Height: float64(img.CropFrame.Height) / float64(imgHeight),
+				}
+				log.Printf("Applied camera aspect ratio crop (B&W profile) for %s: EXIF frame (%d,%d,%d,%d) -> normalized (%.3f,%.3f,%.3f,%.3f)",
+					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
+					edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+			}
 		}
 	}
 

@@ -45,15 +45,16 @@ type Config struct {
 	ImmichTags       []string `json:"immich_tags"`       // Additional tags for all uploads
 
 	// Processing options
-	ProcessRAWFiles      bool `json:"process_raw_files"`       // Process RAW files with RawTherapee (if false, only upload JPGs)
-	UploadCameraJPGs     bool `json:"upload_camera_jpgs"`      // Also upload camera-generated JPGs
-	TagWithProfileName   bool `json:"tag_with_profile_name"`   // Tag processed files with profile name
-	CleanupAfterUpload   bool `json:"cleanup_after_upload"`    // Delete processed files after successful upload
-	DryRun               bool `json:"dry_run"`                 // Don't actually process/upload, just show what would happen
-	SkipUpload           bool `json:"skip_upload"`             // Process files but skip uploading to Immich
-	NoUploadUI           bool `json:"no_upload_ui"`            // Suppress immich-go UI during upload (quiet mode)
-	Limit                int  `json:"limit"`                   // Limit number of files to process (0 = no limit)
-	Workers              int  `json:"workers"`                 // Number of parallel workers for processing (0 = auto based on CPU cores)
+	ProcessRAWFiles        bool `json:"process_raw_files"`         // Process RAW files with RawTherapee (if false, only upload JPGs)
+	UploadCameraJPGs       bool `json:"upload_camera_jpgs"`        // Also upload camera-generated JPGs
+	TagWithProfileName     bool `json:"tag_with_profile_name"`     // Tag processed files with profile name
+	CleanupAfterUpload     bool `json:"cleanup_after_upload"`      // Delete processed files after successful upload
+	DryRun                 bool `json:"dry_run"`                   // Don't actually process/upload, just show what would happen
+	SkipUpload             bool `json:"skip_upload"`               // Process files but skip uploading to Immich
+	NoUploadUI             bool `json:"no_upload_ui"`              // Suppress immich-go UI during upload (quiet mode)
+	Limit                  int  `json:"limit"`                     // Limit number of files to process (0 = no limit)
+	Workers                int  `json:"workers"`                   // Number of parallel workers for processing (0 = auto based on CPU cores)
+	ApplyCameraAspectRatio bool `json:"apply_camera_aspect_ratio"` // Auto-apply camera's aspect ratio from EXIF when processing (OM System cameras)
 }
 
 // DefaultConfig returns a configuration with sensible defaults

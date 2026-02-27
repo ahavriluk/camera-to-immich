@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	customexif "github.com/ohavrylyuk/camera-to-immich/internal/exif"
 )
 
 // RawTherapeeConfig contains configuration for RawTherapee processing
@@ -189,4 +191,150 @@ func ValidateProfile(profilePath string) error {
 	}
 
 	return nil
+}
+
+// GeneratePP3WithAspectRatio creates a PP3 profile with camera aspect ratio crop applied
+// Returns the path to the generated PP3 file, or empty string if no aspect ratio crop is needed
+func GeneratePP3WithAspectRatio(rawPath string, basePP3Content string, outputDir string) (string, error) {
+	// Get aspect ratio info from EXIF
+	aspectInfo, err := customexif.GetAspectRatio(rawPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get aspect ratio: %v", err)
+	}
+
+	// Check if aspectInfo is nil
+	if aspectInfo == nil {
+		return "", nil
+	}
+
+	// Check if we need to apply a crop (only for non-4:3 aspect ratios)
+	if aspectInfo.Ratio == "4:3" || aspectInfo.CropFrame == nil {
+		return "", nil // No crop needed, use default profile
+	}
+
+	// Generate PP3 with crop settings
+	pp3Content := ApplyAspectRatioCropToPP3(basePP3Content, aspectInfo.CropFrame)
+
+	// Write PP3 file
+	baseName := strings.TrimSuffix(filepath.Base(rawPath), filepath.Ext(rawPath))
+	pp3Path := filepath.Join(outputDir, baseName+".pp3")
+
+	if err := os.WriteFile(pp3Path, []byte(pp3Content), 0644); err != nil {
+		return "", fmt.Errorf("failed to write PP3: %v", err)
+	}
+
+	return pp3Path, nil
+}
+
+// ApplyAspectRatioCropToPP3 applies crop settings to a PP3 profile
+func ApplyAspectRatioCropToPP3(pp3Content string, cropFrame *customexif.CropFrame) string {
+	if cropFrame == nil {
+		return pp3Content
+	}
+
+	lines := strings.Split(pp3Content, "\n")
+	result := make([]string, 0, len(lines))
+
+	inSection := ""
+	cropEnabledSet := false
+	cropXSet := false
+	cropYSet := false
+	cropWSet := false
+	cropHSet := false
+
+	for _, line := range lines {
+		// Track current section
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(strings.TrimSpace(line), "]") {
+			inSection = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(line), "]"), "[")
+		}
+
+		// Modify Crop section
+		if inSection == "Crop" {
+			if strings.HasPrefix(line, "Enabled=") {
+				line = "Enabled=true"
+				cropEnabledSet = true
+			}
+			if strings.HasPrefix(line, "X=") {
+				line = fmt.Sprintf("X=%d", cropFrame.X)
+				cropXSet = true
+			}
+			if strings.HasPrefix(line, "Y=") {
+				line = fmt.Sprintf("Y=%d", cropFrame.Y)
+				cropYSet = true
+			}
+			if strings.HasPrefix(line, "W=") {
+				line = fmt.Sprintf("W=%d", cropFrame.Width)
+				cropWSet = true
+			}
+			if strings.HasPrefix(line, "H=") {
+				line = fmt.Sprintf("H=%d", cropFrame.Height)
+				cropHSet = true
+			}
+		}
+
+		result = append(result, line)
+	}
+
+	// Add crop settings if not found in base profile
+	if !cropEnabledSet || !cropXSet || !cropYSet || !cropWSet || !cropHSet {
+		result = ensureCropSection(result, cropFrame, cropEnabledSet, cropXSet, cropYSet, cropWSet, cropHSet)
+	}
+
+	return strings.Join(result, "\n")
+}
+
+// ensureCropSection adds or updates crop settings in PP3 content
+func ensureCropSection(lines []string, cropFrame *customexif.CropFrame, enabledSet, xSet, ySet, wSet, hSet bool) []string {
+	result := make([]string, 0, len(lines)+10)
+	cropSectionFound := false
+	inCropSection := false
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "[Crop]" {
+			cropSectionFound = true
+			inCropSection = true
+			result = append(result, line)
+			// Add missing settings right after section header
+			if !enabledSet {
+				result = append(result, "Enabled=true")
+			}
+			if !xSet {
+				result = append(result, fmt.Sprintf("X=%d", cropFrame.X))
+			}
+			if !ySet {
+				result = append(result, fmt.Sprintf("Y=%d", cropFrame.Y))
+			}
+			if !wSet {
+				result = append(result, fmt.Sprintf("W=%d", cropFrame.Width))
+			}
+			if !hSet {
+				result = append(result, fmt.Sprintf("H=%d", cropFrame.Height))
+			}
+			continue
+		}
+
+		// Check if we're leaving the crop section
+		if inCropSection && strings.HasPrefix(line, "[") {
+			inCropSection = false
+		}
+
+		result = append(result, line)
+	}
+
+	// If no crop section found, add it
+	if !cropSectionFound {
+		result = append(result, "")
+		result = append(result, "[Crop]")
+		result = append(result, "Enabled=true")
+		result = append(result, fmt.Sprintf("X=%d", cropFrame.X))
+		result = append(result, fmt.Sprintf("Y=%d", cropFrame.Y))
+		result = append(result, fmt.Sprintf("W=%d", cropFrame.Width))
+		result = append(result, fmt.Sprintf("H=%d", cropFrame.Height))
+		result = append(result, "FixedRatio=false")
+		result = append(result, "Ratio=As Image")
+		result = append(result, "Orientation=As Image")
+		result = append(result, "Guide=Frame")
+	}
+
+	return result
 }

@@ -195,15 +195,20 @@
                 <div class="control-group">
                     <div class="control-label-row">
                         <label>Crop</label>
+                        <span id="camera-aspect-label" class="camera-aspect-label" style="display: none;">Camera: <span id="camera-aspect-value">4:3</span></span>
                         <button class="reset-btn" onclick="resetCrop()" title="Reset crop">↺</button>
                     </div>
                     <div class="aspect-buttons">
                         <button onclick="setAspect('free')" class="active" data-aspect="free">Free</button>
+                        <button onclick="setAspect('camera')" data-aspect="camera" id="camera-aspect-btn" style="display: none;">📷</button>
                         <button onclick="setAspect('original')" data-aspect="original">Original</button>
                         <button onclick="setAspect('1:1')" data-aspect="1:1">1:1</button>
                         <button onclick="setAspect('3:2')" data-aspect="3:2">3:2</button>
+                        <button onclick="setAspect('2:3')" data-aspect="2:3">2:3</button>
                         <button onclick="setAspect('4:3')" data-aspect="4:3">4:3</button>
+                        <button onclick="setAspect('3:4')" data-aspect="3:4">3:4</button>
                         <button onclick="setAspect('16:9')" data-aspect="16:9">16:9</button>
+                        <button onclick="setAspect('5:4')" data-aspect="5:4">5:4</button>
                     </div>
                 </div>
                 

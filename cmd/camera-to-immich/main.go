@@ -541,6 +541,17 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 	// Initialize Tone Calibration if enabled (for OM-3 cameras)
 	var toneCalibration *processor.ToneCalibration
 	var basePP3Content string
+
+	// Load base PP3 content if needed for tone calibration or aspect ratio processing
+	if cfg.PP3ProfilePath != "" && (cfg.ApplyToneFormula || cfg.ApplyCameraAspectRatio) {
+		data, err := os.ReadFile(cfg.PP3ProfilePath)
+		if err != nil {
+			logInfo("Note: Failed to load base PP3 file: %v (using minimal PP3)", err)
+		} else {
+			basePP3Content = string(data)
+		}
+	}
+
 	if cfg.ApplyToneFormula && cfg.ToneFormulaPath != "" {
 		logStep("Initializing Tone Calibration with formula...")
 		var err error
@@ -549,21 +560,18 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			logInfo("Note: Failed to initialize tone calibration: %v (continuing without)", err)
 			toneCalibration = nil
 		} else {
-			// Load base PP3 content from pp3_profile_path (default profile)
-			if cfg.PP3ProfilePath != "" {
-				data, err := os.ReadFile(cfg.PP3ProfilePath)
-				if err != nil {
-					logInfo("Note: Failed to load base PP3 file: %v (using minimal PP3)", err)
-				} else {
-					basePP3Content = string(data)
-					logSuccess("Tone calibration enabled (formula: %s, base: %s)",
-						filepath.Base(cfg.ToneFormulaPath), filepath.Base(cfg.PP3ProfilePath))
-				}
+			if basePP3Content != "" {
+				logSuccess("Tone calibration enabled (formula: %s, base: %s)",
+					filepath.Base(cfg.ToneFormulaPath), filepath.Base(cfg.PP3ProfilePath))
 			} else {
 				logSuccess("Tone calibration enabled (formula: %s)",
 					filepath.Base(cfg.ToneFormulaPath))
 			}
 		}
+	}
+
+	if cfg.ApplyCameraAspectRatio && basePP3Content != "" {
+		logSuccess("Camera aspect ratio processing enabled (base: %s)", filepath.Base(cfg.PP3ProfilePath))
 	}
 	// Silence unused warnings if tone calibration not used (will be used in processing loop)
 	_ = toneCalibration
@@ -656,6 +664,32 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 				if perImageProfile != "" {
 					// Use per-image profile from editor
 					outputPath, err = rt.ProcessFileWithProfile(inputPath, perImageProfile)
+				} else if cfg.ApplyCameraAspectRatio {
+					// Try to apply camera aspect ratio from EXIF (OM System cameras)
+					aspectPP3Path, aspectErr := processor.GeneratePP3WithAspectRatio(job.rawFile.Path, basePP3Content, cfg.OutputDirectory)
+					if aspectErr == nil && aspectPP3Path != "" {
+						if verbose {
+							logInfo("  Using aspect ratio crop PP3: %s", filepath.Base(aspectPP3Path))
+						}
+						outputPath, err = rt.ProcessFileWithProfile(inputPath, aspectPP3Path)
+						// Clean up generated PP3 after processing
+						defer os.Remove(aspectPP3Path)
+					} else if toneCalibration != nil {
+						// No aspect ratio crop, try tone calibration
+						tonePP3Path, toneErr := toneCalibration.GenerateTonePP3ForRAW(job.rawFile.Path, basePP3Content, cfg.OutputDirectory)
+						if toneErr == nil && tonePP3Path != "" {
+							if verbose {
+								logInfo("  Using tone-adjusted PP3: %s", filepath.Base(tonePP3Path))
+							}
+							outputPath, err = rt.ProcessFileWithProfile(inputPath, tonePP3Path)
+							defer os.Remove(tonePP3Path)
+						} else {
+							outputPath, err = rt.ProcessFile(inputPath)
+						}
+					} else {
+						// No aspect ratio crop needed, use default profile
+						outputPath, err = rt.ProcessFile(inputPath)
+					}
 				} else if toneCalibration != nil {
 					// Try to generate tone-adjusted profile from sidecar JPEG EXIF
 					tonePP3Path, toneErr := toneCalibration.GenerateTonePP3ForRAW(job.rawFile.Path, basePP3Content, cfg.OutputDirectory)

@@ -5,6 +5,8 @@
 *.so
 *.dylib
 om-processor
+grain-analyzer-*
+camera-to-immich
 
 # Build output directories
 dist/
