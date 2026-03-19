@@ -214,6 +214,15 @@ body {
     image-orientation: from-image; /* Respect EXIF orientation */
 }
 
+#preview-canvas {
+    position: absolute;
+    max-width: 100%;
+    max-height: calc(90vh - 120px);
+    object-fit: contain;
+    display: none; /* Hidden until WebGL is active */
+    pointer-events: none; /* Let clicks pass through to overlays */
+}
+
 /* Controls Panel (on right) */
 .controls {
     padding: 20px;
