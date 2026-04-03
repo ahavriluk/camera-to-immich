@@ -34,18 +34,19 @@ var templatesFS embed.FS
 
 // ImageInfo represents an image for the web editor
 type ImageInfo struct {
-	ID           string          `json:"id"`
-	Filename     string          `json:"filename"`
-	Path         string          `json:"path"`
-	BaseName     string          `json:"baseName"` // Filename without extension (for sidecar matching)
-	PreviewURL   string          `json:"previewUrl"`
-	ThumbnailURL string          `json:"thumbnailUrl"`
-	IsRAW        bool            `json:"isRaw"`
-	Size         int64           `json:"size"`
-	ModTime      int64           `json:"modTime"`           // File modification time (for display)
-	CaptureTime  int64           `json:"captureTime"`       // EXIF capture time (for filtering/sorting)
-	AspectRatio  string          `json:"aspectRatio"`       // Camera aspect ratio (e.g., "4:3", "3:2", "16:9")
-	CropFrame    *CropFrameInfo  `json:"cropFrame"`         // Optional crop frame from EXIF
+	ID                 string          `json:"id"`
+	Filename           string          `json:"filename"`
+	Path               string          `json:"path"`
+	BaseName           string          `json:"baseName"` // Filename without extension (for sidecar matching)
+	PreviewURL         string          `json:"previewUrl"`
+	ThumbnailURL       string          `json:"thumbnailUrl"`
+	IsRAW              bool            `json:"isRaw"`
+	Size               int64           `json:"size"`
+	ModTime            int64           `json:"modTime"`           // File modification time (for display)
+	CaptureTime        int64           `json:"captureTime"`       // EXIF capture time (for filtering/sorting)
+	AspectRatio        string          `json:"aspectRatio"`       // Camera aspect ratio (e.g., "4:3", "3:2", "16:9")
+	DisplayAspectRatio string          `json:"displayAspectRatio"` // Aspect ratio adjusted for EXIF orientation (e.g., "3:4" for portrait 4:3)
+	CropFrame          *CropFrameInfo  `json:"cropFrame"`         // Optional crop frame from EXIF
 }
 
 // CropFrameInfo represents crop coordinates from camera EXIF data
@@ -377,6 +378,9 @@ func (s *Server) scanImages(sourcePath string, limit int) error {
 				}
 			}
 		}
+		
+		// Compute display-oriented aspect ratio (accounts for EXIF orientation)
+		imgInfo.DisplayAspectRatio = customexif.GetDisplayAspectRatio(f.Path)
 		
 		s.images = append(s.images, imgInfo)
 	}

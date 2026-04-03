@@ -393,7 +393,13 @@ function getEdit(index) {
             touched: false
         };
     }
-    return state.edits[img.id];
+    const edit = state.edits[img.id];
+    // Normalize: treat full-image crop as no crop
+    if (edit.crop && edit.crop.x === 0 && edit.crop.y === 0 &&
+        edit.crop.width === 1 && edit.crop.height === 1) {
+        edit.crop = null;
+    }
+    return edit;
 }
 
 function markTouched() {
@@ -434,12 +440,27 @@ function updateStats() {
 }
 
 // Get camera aspect ratio from current image EXIF data
+// Uses server-computed displayAspectRatio which accounts for EXIF orientation
 function getCameraAspectRatio() {
     const img = state.images[state.currentIndex];
-    if (!img || !img.aspectRatio) {
-        return 4/3; // Default for OM System cameras (4:3 sensor)
+    if (!img) return 4/3;
+    
+    // Use display aspect ratio (already orientation-adjusted by server)
+    if (img.displayAspectRatio) {
+        return parseAspectRatioString(img.displayAspectRatio);
     }
-    return parseAspectRatioString(img.aspectRatio);
+    if (img.aspectRatio) {
+        return parseAspectRatioString(img.aspectRatio);
+    }
+    return 4/3; // Default for OM System cameras (4:3 sensor)
+}
+
+// Get the display-oriented aspect ratio STRING for the current image
+// Uses server-computed displayAspectRatio (no JS orientation detection needed)
+function getDisplayAspectRatioString() {
+    const img = state.images[state.currentIndex];
+    if (!img) return null;
+    return img.displayAspectRatio || img.aspectRatio || null;
 }
 
 // Parse aspect ratio string like "16:9" or "3:4" into numeric ratio
@@ -455,11 +476,27 @@ function parseAspectRatioString(ratioStr) {
     return 4/3; // Default fallback
 }
 
-// Check if current image has a custom camera aspect ratio (non-4:3)
+// Check if current image has a non-default camera aspect ratio
+// Returns true for images where the camera set a crop different from the native 4:3 sensor
+// Uses displayAspectRatio for orientation-aware comparison
 function hasCustomCameraAspect() {
     const img = state.images[state.currentIndex];
-    return img && img.aspectRatio && img.aspectRatio !== '4:3';
+    if (!img) return false;
+    
+    const displayRatio = img.displayAspectRatio || img.aspectRatio;
+    if (!displayRatio) return false;
+    
+    // 4:3 and 3:4 are the native sensor format (landscape/portrait)
+    if (displayRatio === '4:3' || displayRatio === '3:4') return false;
+    
+    return true;
 }
+
+// Standard aspect ratio buttons available in the UI
+const standardAspectButtons = new Set([
+    'free', 'original', '1:1', '3:2', '2:3', '4:3', '3:4',
+    '16:9', '9:16', '5:4', '4:5'
+]);
 
 // Update camera aspect ratio UI elements
 function updateCameraAspectUI(img) {
@@ -467,15 +504,24 @@ function updateCameraAspectUI(img) {
     const valueEl = document.getElementById('camera-aspect-value');
     const btnEl = document.getElementById('camera-aspect-btn');
     
-    if (img && img.aspectRatio && img.aspectRatio !== '4:3') {
-        // Show camera aspect ratio info and button
-        labelEl.style.display = 'inline';
-        btnEl.style.display = 'inline-block';
-        valueEl.textContent = img.aspectRatio;
-        btnEl.textContent = '📷 ' + img.aspectRatio;
-        btnEl.title = 'Apply camera aspect ratio: ' + img.aspectRatio;
+    if (hasCustomCameraAspect()) {
+        const displayRatio = img.displayAspectRatio || img.aspectRatio || '4:3';
+        
+        // Only show camera button if ratio doesn't match a standard button
+        if (standardAspectButtons.has(displayRatio)) {
+            // Standard ratio - no need for camera label/button, standard button suffices
+            labelEl.style.display = 'none';
+            btnEl.style.display = 'none';
+        } else {
+            // Non-standard ratio - show camera button
+            labelEl.style.display = 'inline';
+            btnEl.style.display = 'inline-block';
+            valueEl.textContent = displayRatio;
+            btnEl.textContent = '📷 ' + displayRatio;
+            btnEl.title = 'Apply camera aspect ratio: ' + displayRatio;
+        }
     } else {
-        // Hide camera aspect ratio elements for 4:3 images
+        // Hide camera aspect ratio elements for 4:3 images (native sensor format)
         labelEl.style.display = 'none';
         btnEl.style.display = 'none';
     }
@@ -489,7 +535,9 @@ function openModal(index) {
     
     document.getElementById('modal').classList.add('active');
     document.getElementById('modal-filename').textContent = img.filename;
-    document.getElementById('preview-image').src = img.previewUrl;
+    
+    const previewImg = document.getElementById('preview-image');
+    previewImg.src = img.previewUrl;
     
     // Invalidate WebGL texture so it re-uploads the new image
     if (exposureRenderer) {
@@ -502,43 +550,55 @@ function openModal(index) {
     document.getElementById('rotation').value = edit.rotation;
     document.getElementById('rotation-value').textContent = edit.rotation.toFixed(1) + '°';
     
-    // Update camera aspect ratio UI
-    updateCameraAspectUI(img);
-    
     updateBWToggle(edit.bw);
     updateExposurePresets(edit.exposure);
     
-    // If this is an untouched image with custom camera aspect ratio, auto-apply it
-    if (!edit.touched && hasCustomCameraAspect() && !edit.crop) {
-        // Auto-apply camera aspect ratio for untouched images with non-4:3 aspect
-        edit.aspect = 'camera';
-        updateAspectButtons('camera');
-        // Wait for image to load before initializing crop
-        const previewImg = document.getElementById('preview-image');
-        if (previewImg.complete) {
-            document.getElementById('crop-overlay').classList.add('active');
-            initializeCropArea('camera');
-        } else {
-            previewImg.addEventListener('load', () => {
-                document.getElementById('crop-overlay').classList.add('active');
-                initializeCropArea('camera');
-            }, { once: true });
+    // Update camera aspect ratio UI - uses server-side data, no image load needed
+    updateCameraAspectUI(img);
+    
+    // Set aspect ratio button - uses server-computed displayAspectRatio (no race condition)
+    if (edit.touched && edit.crop) {
+        // Image was edited AND has a real crop - restore saved state
+        let savedAspect = edit.aspect || 'free';
+        // Map 'camera' to actual display ratio if camera button is hidden
+        if (savedAspect === 'camera') {
+            savedAspect = img.displayAspectRatio || img.aspectRatio || 'free';
         }
+        updateAspectButtons(savedAspect);
     } else {
-        updateAspectButtons(edit.aspect || 'free');
-        
-        // Restore crop overlay if this image has saved crop data
-        if (edit.crop) {
-            document.getElementById('crop-overlay').classList.add('active');
-            // Wait for image to load before restoring crop position
-            const previewImg = document.getElementById('preview-image');
-            if (previewImg.complete) {
-                restoreCropArea(edit);
-            } else {
-                previewImg.addEventListener('load', () => restoreCropArea(edit), { once: true });
-            }
+        // Untouched image OR no actual crop - auto-select the correct aspect ratio button
+        const displayRatio = getDisplayAspectRatioString();
+        if (displayRatio) {
+            edit.aspect = displayRatio;
+            updateAspectButtons(displayRatio);
         } else {
-            document.getElementById('crop-overlay').classList.remove('active');
+            edit.aspect = 'free';
+            updateAspectButtons('free');
+        }
+    }
+    
+    // Handle crop overlay
+    // Only show crop overlay for images the user has actually edited (touched)
+    // Untouched images may have stale crop data from previous sessions - ignore it
+    document.getElementById('crop-overlay').classList.remove('active');
+    
+    if (!edit.touched) {
+        // Clear any stale crop data from old sessions for untouched images
+        edit.crop = null;
+    }
+    
+    if (edit.touched && edit.crop) {
+        const openIndex = index;
+        const onImageReady = () => {
+            if (state.currentIndex !== openIndex) return;
+            document.getElementById('crop-overlay').classList.add('active');
+            restoreCropArea(edit);
+        };
+        
+        if (previewImg.complete && previewImg.naturalWidth > 0) {
+            onImageReady();
+        } else {
+            previewImg.addEventListener('load', onImageReady, { once: true });
         }
     }
     
@@ -548,9 +608,7 @@ function openModal(index) {
     if (edit.rotation !== 0) {
         document.getElementById('grid-lines').classList.add('visible');
         document.getElementById('rotation-crop-overlay').classList.add('visible');
-        // Update crop preview after image loads
-        const previewImg = document.getElementById('preview-image');
-        if (previewImg.complete) {
+        if (previewImg.complete && previewImg.naturalWidth > 0) {
             updateRotationCropPreview(edit.rotation);
         }
     } else {
@@ -755,6 +813,7 @@ function updateRotationCropPreview(angleDegrees) {
 
 // Update crop preview when image loads
 document.getElementById('preview-image').addEventListener('load', function() {
+    if (!state.images || !state.images[state.currentIndex]) return;
     const edit = getEdit(state.currentIndex);
     if (edit.rotation !== 0) {
         updateRotationCropPreview(edit.rotation);
@@ -820,15 +879,12 @@ function initializeCropArea(aspect) {
     const ratio = aspectRatios[aspect] || imgAspect;
     
     // Fit the crop area to fill as much of the image as possible
-    // No margin - use the full image dimensions as constraints
     if (imgAspect > ratio) {
         // Image is wider than target ratio - height is the constraint
-        // Crop box will touch top and bottom edges
         cropHeight = imgHeight;
         cropWidth = cropHeight * ratio;
     } else {
         // Image is taller than target ratio - width is the constraint
-        // Crop box will touch left and right edges
         cropWidth = imgWidth;
         cropHeight = cropWidth / ratio;
     }
@@ -1009,12 +1065,23 @@ function initCropDragHandlers() {
                 const aspectRatios = {
                     '1:1': 1,
                     '3:2': 3/2,
+                    '2:3': 2/3,
                     '4:3': 4/3,
+                    '3:4': 3/4,
                     '16:9': 16/9,
+                    '9:16': 9/16,
                     '5:4': 5/4,
-                    'original': cropDragState.startWidth / cropDragState.startHeight
+                    '4:5': 4/5,
+                    '7:6': 7/6,
+                    '6:7': 6/7,
+                    '6:5': 6/5,
+                    '5:6': 5/6,
+                    '7:5': 7/5,
+                    '5:7': 5/7,
+                    'original': cropDragState.startWidth / cropDragState.startHeight,
+                    'camera': getCameraAspectRatio()
                 };
-                const ratio = aspectRatios[state.currentAspect] || 1;
+                const ratio = aspectRatios[state.currentAspect] || (cropDragState.startWidth / cropDragState.startHeight);
                 
                 // Adjust height based on width, then check bounds
                 if (cropDragState.handle.includes('r') || cropDragState.handle.includes('l')) {
@@ -1290,6 +1357,14 @@ function adjustExposureByStep(step) {
     const snapped = snapToStop(newValue);
     document.getElementById('exposure').value = snapped;
     setExposure(snapped);
+}
+
+// Adjust rotation by a fine step (±0.1°)
+function adjustRotationByStep(step) {
+    const current = parseFloat(document.getElementById('rotation').value);
+    const newValue = Math.max(-15, Math.min(15, Math.round((current + step) * 10) / 10));
+    document.getElementById('rotation').value = newValue;
+    updateRotation(newValue);
 }
 
 // Process

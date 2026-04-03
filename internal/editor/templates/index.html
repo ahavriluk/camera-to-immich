@@ -112,7 +112,18 @@
                 <div class="preview-container" id="preview-container">
                     <img id="preview-image" src="https://picsum.photos/seed/1/1200/800" alt="Preview">
                     <canvas id="preview-canvas"></canvas>
-                    <div class="grid-lines" id="grid-lines"></div>
+                    <div class="grid-lines" id="grid-lines">
+                        <div class="grid-line-h" style="top: 16.67%"></div>
+                        <div class="grid-line-h" style="top: 33.33%"></div>
+                        <div class="grid-line-h" style="top: 50%"></div>
+                        <div class="grid-line-h" style="top: 66.67%"></div>
+                        <div class="grid-line-h" style="top: 83.33%"></div>
+                        <div class="grid-line-v" style="left: 16.67%"></div>
+                        <div class="grid-line-v" style="left: 33.33%"></div>
+                        <div class="grid-line-v" style="left: 50%"></div>
+                        <div class="grid-line-v" style="left: 66.67%"></div>
+                        <div class="grid-line-v" style="left: 83.33%"></div>
+                    </div>
                     <div class="rotation-crop-overlay" id="rotation-crop-overlay">
                         <div class="rotation-crop-box" id="rotation-crop-box"></div>
                     </div>
@@ -190,6 +201,10 @@
                         <span class="slider-label">+15°</span>
                         <span class="slider-value" id="rotation-value">0°</span>
                     </div>
+                    <div class="rotation-step-buttons">
+                        <button class="step-btn" onclick="adjustRotationByStep(-0.1)" title="Rotate -0.1°">-0.1°</button>
+                        <button class="step-btn" onclick="adjustRotationByStep(0.1)" title="Rotate +0.1°">+0.1°</button>
+                    </div>
                 </div>
                 
                 <!-- Crop Aspect Ratio -->
@@ -209,7 +224,9 @@
                         <button onclick="setAspect('4:3')" data-aspect="4:3">4:3</button>
                         <button onclick="setAspect('3:4')" data-aspect="3:4">3:4</button>
                         <button onclick="setAspect('16:9')" data-aspect="16:9">16:9</button>
+                        <button onclick="setAspect('9:16')" data-aspect="9:16">9:16</button>
                         <button onclick="setAspect('5:4')" data-aspect="5:4">5:4</button>
+                        <button onclick="setAspect('4:5')" data-aspect="4:5">4:5</button>
                     </div>
                 </div>
                 

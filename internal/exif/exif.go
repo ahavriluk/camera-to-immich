@@ -106,6 +106,89 @@ func GetDateTimeOriginalWithFallback(filePath string) time.Time {
 	return dt
 }
 
+// GetOrientation reads the EXIF Orientation tag from an image file
+// Returns orientation value 1-8, or 1 if not found/error
+// Orientations 5-8 indicate the image is rotated 90° or 270° (portrait display)
+func GetOrientation(filePath string) int {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	
+	// For RAW files, use exiftool
+	if rawExtensions[ext] {
+		return getOrientationExiftool(filePath)
+	}
+	
+	// For standard formats, use Go library
+	return getOrientationGoLib(filePath)
+}
+
+// getOrientationExiftool uses exiftool to read EXIF Orientation
+func getOrientationExiftool(filePath string) int {
+	cmd := exec.Command("exiftool", "-Orientation", "-n", "-s3", filePath)
+	output, err := cmd.Output()
+	if err != nil {
+		return 1
+	}
+	val := strings.TrimSpace(string(output))
+	orientation, err := strconv.Atoi(val)
+	if err != nil || orientation < 1 || orientation > 8 {
+		return 1
+	}
+	return orientation
+}
+
+// getOrientationGoLib uses the Go EXIF library for JPEG/TIFF
+func getOrientationGoLib(filePath string) int {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 1
+	}
+	defer f.Close()
+	
+	x, err := exif.Decode(f)
+	if err != nil {
+		return 1
+	}
+	
+	orientTag, err := x.Get(exif.Orientation)
+	if err != nil {
+		return 1
+	}
+	
+	val, err := orientTag.Int(0)
+	if err != nil {
+		return 1
+	}
+	
+	if val >= 1 && val <= 8 {
+		return val
+	}
+	return 1
+}
+
+// IsPortraitOrientation returns true if the EXIF orientation indicates
+// the image should be displayed in portrait mode (rotated 90° or 270°)
+func IsPortraitOrientation(orientation int) bool {
+	// Orientations 5-8 involve a 90° or 270° rotation
+	return orientation >= 5 && orientation <= 8
+}
+
+// GetDisplayAspectRatio returns the aspect ratio string adjusted for EXIF orientation
+// For example, a "16:9" image with portrait orientation returns "9:16"
+func GetDisplayAspectRatio(filePath string) string {
+	ratio := GetAspectRatioWithFallback(filePath)
+	orientation := GetOrientation(filePath)
+	
+	if IsPortraitOrientation(orientation) {
+		// Swap the ratio components for portrait orientation
+		parts := strings.Split(ratio, ":")
+		if len(parts) == 2 {
+			return parts[1] + ":" + parts[0]
+		}
+	}
+	
+	return ratio
+}
+
 // AspectRatioInfo contains the aspect ratio information from camera EXIF data
 type AspectRatioInfo struct {
 	Ratio      string    // Human-readable ratio like "3:2", "16:9", "4:3", etc.
