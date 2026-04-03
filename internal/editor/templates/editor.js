@@ -9,6 +9,7 @@ const state = {
     dragType: null,
     isLoading: false,
     useApi: true, // Set to false to use demo images for preview
+    currentFilter: 'all', // 'all', 'edited', 'unedited', 'skipped'
 };
 
 // WebGL Exposure Renderer - GPU-accelerated exposure preview
@@ -269,6 +270,9 @@ async function init() {
     // Apply B&W filters to thumbnails based on saved state
     updateAllThumbnailFilters();
     
+    // Apply any active filter
+    applyFilter();
+    
     showLoading(false);
 }
 
@@ -422,12 +426,23 @@ function getGridItemClass(index) {
 function updateGridItem(index) {
     const items = document.querySelectorAll('.grid-item');
     if (items[index]) {
-        items[index].className = `grid-item ${getGridItemClass(index)}`;
+        const classes = ['grid-item', getGridItemClass(index)];
+        // Preserve filter-hidden class based on current filter
+        const edit = state.edits[state.images[index]?.id];
+        const isEdited = edit && edit.touched && !edit.skip;
+        const isSkipped = edit && edit.skip;
+        let visible = true;
+        switch (state.currentFilter) {
+            case 'edited': visible = isEdited; break;
+            case 'unedited': visible = !isEdited && !isSkipped; break;
+            case 'skipped': visible = isSkipped; break;
+        }
+        if (!visible) classes.push('filter-hidden');
+        items[index].className = classes.join(' ');
         
         // Apply B&W filter to thumbnail
         const img = items[index].querySelector('img');
         if (img) {
-            const edit = state.edits[state.images[index]?.id];
             const isBW = edit ? edit.bw : (state.globalPreset === 'bw');
             img.style.filter = isBW ? 'grayscale(1)' : '';
         }
@@ -437,6 +452,69 @@ function updateGridItem(index) {
 function updateStats() {
     const editedCount = Object.values(state.edits).filter(e => e.touched && !e.skip).length;
     document.getElementById('edited-count').textContent = editedCount;
+}
+
+// Filter functions
+function setFilter(filter) {
+    state.currentFilter = filter;
+    // Update filter button states
+    document.querySelectorAll('.filter-controls button').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.filter === filter);
+    });
+    applyFilter();
+}
+
+function applyFilter() {
+    const items = document.querySelectorAll('.grid-item');
+    items.forEach((item, i) => {
+        if (!state.images[i]) return;
+        const edit = state.edits[state.images[i].id];
+        const isEdited = edit && edit.touched && !edit.skip;
+        const isSkipped = edit && edit.skip;
+
+        let visible = true;
+        switch (state.currentFilter) {
+            case 'edited':
+                visible = isEdited;
+                break;
+            case 'unedited':
+                visible = !isEdited && !isSkipped;
+                break;
+            case 'skipped':
+                visible = isSkipped;
+                break;
+            default: // 'all'
+                visible = true;
+        }
+        item.classList.toggle('filter-hidden', !visible);
+    });
+}
+
+// Reset all edits back to original settings
+function resetAllEdits() {
+    const editedCount = Object.values(state.edits).filter(e => e.touched).length;
+    if (editedCount === 0) {
+        return; // Nothing to reset
+    }
+    
+    if (!confirm(`Reset all ${editedCount} modified image(s) back to original settings?\n\nThis cannot be undone.`)) {
+        return;
+    }
+    
+    // Clear all edits
+    state.edits = {};
+    
+    // Re-render grid to update visual indicators
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    updateStats();
+    applyFilter();
+    
+    // Save the cleared state
+    localStorage.setItem('camera-edits', JSON.stringify(state.edits));
+    if (state.useApi) {
+        saveEditsToApi();
+    }
 }
 
 // Get camera aspect ratio from current image EXIF data

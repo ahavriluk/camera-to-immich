@@ -16,6 +16,15 @@
                 <span id="edited-count">0</span> edited of <span id="total-count">0</span>
             </div>
             
+            <div class="filter-controls">
+                <button class="active" onclick="setFilter('all')" data-filter="all">All</button>
+                <button onclick="setFilter('edited')" data-filter="edited">Modified</button>
+                <button onclick="setFilter('unedited')" data-filter="unedited">Unmodified</button>
+                <button onclick="setFilter('skipped')" data-filter="skipped">Skipped</button>
+            </div>
+
+            <button class="btn-reset-all" onclick="resetAllEdits()" title="Reset all modified images back to original settings">↺ Reset All Edits</button>
+            
             <div class="preset-toggle">
                 <button id="global-color" class="active" onclick="setGlobalPreset('color')">Color</button>
                 <button id="global-bw" onclick="setGlobalPreset('bw')">B&W</button>
