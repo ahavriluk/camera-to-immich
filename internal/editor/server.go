@@ -2198,66 +2198,84 @@ ExifKeys=Exif.Image.Artist;Exif.Image.Copyright;Exif.Image.ImageDescription;Exif
 	}
 
 	// Get image dimensions for crop calculation
-	// IMPORTANT: For RAW files with camera aspect ratio, we need to use the EXIF RAW dimensions
-	// not the sidecar JPG dimensions (which are already cropped by the camera)
 	imgWidth, imgHeight := 0, 0
-	useExifCropFrameDirectly := false
 
-	// Check if this image has a non-4:3 camera aspect ratio
+	// Check if this image has a non-4:3 camera aspect ratio with EXIF crop frame
 	hasNon43AspectRatio := img.AspectRatio != "" && img.AspectRatio != "4:3" && img.CropFrame != nil
 
-	if edit.Crop != nil || edit.Aspect == "camera" || hasNon43AspectRatio {
-		if hasNon43AspectRatio && img.CropFrame != nil {
-			// For non-4:3 aspect ratio images, calculate RAW sensor dimensions from crop frame
-			// The crop frame defines the region within the full RAW sensor
-			// For OM-3: full sensor is 5184x3888 (approximately), crop frame X+Width gives us one boundary
-			// Use the EXIF crop frame directly for PP3 - no normalization needed
-			useExifCropFrameDirectly = true
-			// We still need dimensions for other crop operations, estimate from crop frame
-			// The crop frame represents the usable area, and X+Width or Y+Height give max bounds
-			imgWidth = img.CropFrame.X + img.CropFrame.Width
-			imgHeight = img.CropFrame.Y + img.CropFrame.Height
-			log.Printf("Using EXIF crop frame directly for %s (aspect %s): (%d,%d,%d,%d)",
-				img.Filename, img.AspectRatio, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
-		} else {
-			var err error
-			imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
-			if err != nil {
-				log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+	if hasNon43AspectRatio && img.CropFrame != nil {
+		// NON-4:3 IMAGE: Transform EXIF crop frame to post-orientation PP3 space
+		// All PP3 crop coordinates must be in post-orientation pixel space.
+		// EXIF crop frame is in sensor (pre-orientation) space, so we transform it.
+		orientation := customexif.GetOrientation(img.Path)
+		isPortrait := customexif.IsPortraitOrientation(orientation)
+
+		// Get sensor dimensions (needed for portrait orientation transformation)
+		sensorW := img.CropFrame.X + img.CropFrame.Width
+		sensorH := img.CropFrame.Y + img.CropFrame.Height
+		if isPortrait {
+			if actualW, actualH, err := s.getRawSensorDimensions(img.Path); err == nil {
+				sensorW, sensorH = actualW, actualH
+			} else {
+				log.Printf("Warning: failed to get raw sensor dimensions for %s: %v, estimating", img.Filename, err)
+				// Estimate: assume 4:3 sensor
+				if sensorW > sensorH {
+					sensorH = sensorW * 3 / 4
+				} else {
+					sensorW = sensorH * 4 / 3
+				}
 			}
 		}
-	}
 
-	// If camera aspect ratio is selected OR image has non-4:3 aspect ratio, use EXIF crop frame
-	if (edit.Aspect == "camera" || hasNon43AspectRatio) && img.CropFrame != nil {
-		// For untouched images with non-4:3 aspect ratio, auto-apply the camera crop
-		// Don't apply if user has manually set a different crop
-		if edit.Crop == nil || (edit.Crop.X == 0 && edit.Crop.Y == 0 && edit.Crop.Width == 1 && edit.Crop.Height == 1) {
-			if useExifCropFrameDirectly {
-				// Use EXIF crop frame pixel coordinates directly
-				edit.Crop = &CropBox{
-					X:      float64(img.CropFrame.X),
-					Y:      float64(img.CropFrame.Y),
-					Width:  float64(img.CropFrame.Width),
-					Height: float64(img.CropFrame.Height),
-				}
-				// Mark that we're using pixel coordinates directly (not normalized)
-				// by setting imgWidth/imgHeight to indicate direct pixel mode
-				imgWidth = 1
-				imgHeight = 1
-				log.Printf("Applied camera aspect ratio crop for %s: using EXIF frame pixels (%d,%d,%d,%d)",
-					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
-			} else if imgWidth > 0 && imgHeight > 0 {
-				// Convert camera's EXIF crop frame to normalized crop box
-				edit.Crop = &CropBox{
-					X:      float64(img.CropFrame.X) / float64(imgWidth),
-					Y:      float64(img.CropFrame.Y) / float64(imgHeight),
-					Width:  float64(img.CropFrame.Width) / float64(imgWidth),
-					Height: float64(img.CropFrame.Height) / float64(imgHeight),
-				}
-				log.Printf("Applied camera aspect ratio crop for %s: EXIF frame (%d,%d,%d,%d) -> normalized (%.3f,%.3f,%.3f,%.3f)",
-					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
-					edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+		// Transform EXIF frame to post-orientation PP3 space
+		pp3Frame := transformFrameToPostOrientation(img.CropFrame, orientation, sensorW, sensorH)
+		log.Printf("Transformed EXIF frame for %s: sensor(%d,%d,%d,%d) orientation=%d -> PP3(%.0f,%.0f,%.0f,%.0f)",
+			img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
+			orientation, pp3Frame.X, pp3Frame.Y, pp3Frame.Width, pp3Frame.Height)
+
+		// Determine if the user's aspect matches the camera's native aspect
+		// (exact match or reciprocal for portrait orientation, e.g., "9:16" matches camera "16:9")
+		cameraCropMode := edit.Aspect == "camera" || edit.Aspect == "" ||
+			edit.Aspect == img.AspectRatio || isReciprocalAspect(edit.Aspect, img.AspectRatio)
+
+		if edit.Crop != nil {
+			// User drew a crop on the displayed image.
+			// User's crop is normalized (0-1) within the displayed camera frame.
+			// Convert to absolute PP3 pixel coordinates within the transformed frame.
+			edit.Crop = &CropBox{
+				X:      pp3Frame.X + edit.Crop.X*pp3Frame.Width,
+				Y:      pp3Frame.Y + edit.Crop.Y*pp3Frame.Height,
+				Width:  edit.Crop.Width * pp3Frame.Width,
+				Height: edit.Crop.Height * pp3Frame.Height,
+			}
+			imgWidth = 1
+			imgHeight = 1
+			log.Printf("Converted user crop to PP3 pixels for %s: (%.0f,%.0f,%.0f,%.0f)",
+				img.Filename, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+		} else if cameraCropMode && edit.Aspect != "free" {
+			// Untouched or "camera" aspect — apply camera's EXIF frame in PP3 space
+			edit.Crop = pp3Frame
+			imgWidth = 1
+			imgHeight = 1
+			log.Printf("Applied camera EXIF frame in PP3 space for %s: (%.0f,%.0f,%.0f,%.0f)",
+				img.Filename, pp3Frame.X, pp3Frame.Y, pp3Frame.Width, pp3Frame.Height)
+		}
+		// else: user set different aspect with no drawn crop → handled by auto-generate section below
+
+	} else if edit.Crop != nil {
+		// STANDARD 4:3 IMAGE with user crop — get post-orientation dimensions
+		var err error
+		imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
+		if err != nil {
+			log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+		}
+		// Swap for portrait orientation (PP3 uses post-orientation coordinates)
+		if imgWidth > 0 && imgHeight > 0 {
+			orientation := customexif.GetOrientation(img.Path)
+			if customexif.IsPortraitOrientation(orientation) && imgWidth > imgHeight {
+				imgWidth, imgHeight = imgHeight, imgWidth
+				log.Printf("Swapped dimensions for portrait orientation %d: %s now %dx%d",
+					orientation, img.Filename, imgWidth, imgHeight)
 			}
 		}
 	}
@@ -2278,6 +2296,45 @@ ExifKeys=Exif.Image.Artist;Exif.Image.Copyright;Exif.Image.ImageDescription;Exif
 					teSettings.Band0, teSettings.Band1, teSettings.Band2, teSettings.Band3, teSettings.Band4)
 			} else {
 				log.Printf("Note: Failed to extract tone settings for %s: %v", img.Filename, toneErr)
+			}
+		}
+	}
+
+	// If user set a specific aspect ratio but crop data is null, auto-generate a centered crop
+	if edit.Crop == nil && edit.Aspect != "" && edit.Aspect != "free" && edit.Aspect != "camera" {
+		if hasNon43AspectRatio && img.CropFrame != nil {
+			// For non-4:3 images with user aspect override, generate crop within the camera frame
+			// This properly handles portrait orientation and frame offsets
+			edit.Crop = s.generateUserCropWithinCameraFrame(edit.Aspect, img.CropFrame, img.Path)
+			if edit.Crop != nil {
+				imgWidth = 1
+				imgHeight = 1
+				log.Printf("Auto-generated crop within camera frame for %s: aspect=%s -> pixels (%.0f,%.0f,%.0f,%.0f)",
+					img.Filename, edit.Aspect, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+			}
+		} else {
+			// Standard path for 4:3 images
+			// Need image dimensions to generate crop
+			if imgWidth == 0 || imgHeight == 0 {
+				var dimErr error
+				imgWidth, imgHeight, dimErr = s.getImageDimensions(img.Path)
+				if dimErr != nil {
+					log.Printf("Warning: failed to get image dimensions for auto-crop %s: %v", img.Filename, dimErr)
+				}
+				// Swap for portrait orientation
+				if imgWidth > 0 && imgHeight > 0 {
+					orientation := customexif.GetOrientation(img.Path)
+					if customexif.IsPortraitOrientation(orientation) && imgWidth > imgHeight {
+						imgWidth, imgHeight = imgHeight, imgWidth
+					}
+				}
+			}
+			if imgWidth > 0 && imgHeight > 0 {
+				edit.Crop = generateCropFromAspect(edit.Aspect, imgWidth, imgHeight)
+				if edit.Crop != nil {
+					log.Printf("Auto-generated crop for %s: aspect=%s -> normalized (%.3f,%.3f,%.3f,%.3f) for image %dx%d",
+						img.Filename, edit.Aspect, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height, imgWidth, imgHeight)
+				}
 			}
 		}
 	}
@@ -2309,57 +2366,107 @@ func (s *Server) generatePP3WithProfile(img *ImageInfo, edit EditData, globalPre
 	log.Printf("Using custom B&W profile: %s", filepath.Base(customProfilePath))
 
 	// Get image dimensions for crop calculation
-	// IMPORTANT: For RAW files with camera aspect ratio, we need to use the EXIF RAW dimensions
-	// not the sidecar JPG dimensions (which are already cropped by the camera)
 	imgWidth, imgHeight := 0, 0
-	useExifCropFrameDirectly := false
 
-	// Check if this image has a non-4:3 camera aspect ratio
+	// Check if this image has a non-4:3 camera aspect ratio with EXIF crop frame
 	hasNon43AspectRatio := img.AspectRatio != "" && img.AspectRatio != "4:3" && img.CropFrame != nil
 
-	if edit.Crop != nil || edit.Aspect == "camera" || hasNon43AspectRatio {
-		if hasNon43AspectRatio && img.CropFrame != nil {
-			// For non-4:3 aspect ratio images, use EXIF crop frame directly
-			useExifCropFrameDirectly = true
-			imgWidth = img.CropFrame.X + img.CropFrame.Width
-			imgHeight = img.CropFrame.Y + img.CropFrame.Height
-			log.Printf("Using EXIF crop frame directly (B&W) for %s (aspect %s): (%d,%d,%d,%d)",
-				img.Filename, img.AspectRatio, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
-		} else {
-			var err error
-			imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
-			if err != nil {
-				log.Printf("Warning: failed to get image dimensions for %s: %v (crop may not work)", img.Filename, err)
+	if hasNon43AspectRatio && img.CropFrame != nil {
+		// NON-4:3 IMAGE (B&W): Transform EXIF crop frame to post-orientation PP3 space
+		orientation := customexif.GetOrientation(img.Path)
+		isPortrait := customexif.IsPortraitOrientation(orientation)
+
+		sensorW := img.CropFrame.X + img.CropFrame.Width
+		sensorH := img.CropFrame.Y + img.CropFrame.Height
+		if isPortrait {
+			if actualW, actualH, err := s.getRawSensorDimensions(img.Path); err == nil {
+				sensorW, sensorH = actualW, actualH
+			} else {
+				log.Printf("Warning: failed to get raw sensor dimensions (B&W) for %s: %v, estimating", img.Filename, err)
+				if sensorW > sensorH {
+					sensorH = sensorW * 3 / 4
+				} else {
+					sensorW = sensorH * 4 / 3
+				}
+			}
+		}
+
+		pp3Frame := transformFrameToPostOrientation(img.CropFrame, orientation, sensorW, sensorH)
+		log.Printf("Transformed EXIF frame (B&W) for %s: sensor(%d,%d,%d,%d) orientation=%d -> PP3(%.0f,%.0f,%.0f,%.0f)",
+			img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
+			orientation, pp3Frame.X, pp3Frame.Y, pp3Frame.Width, pp3Frame.Height)
+
+		cameraCropMode := edit.Aspect == "camera" || edit.Aspect == "" ||
+			edit.Aspect == img.AspectRatio || isReciprocalAspect(edit.Aspect, img.AspectRatio)
+
+		if edit.Crop != nil {
+			edit.Crop = &CropBox{
+				X:      pp3Frame.X + edit.Crop.X*pp3Frame.Width,
+				Y:      pp3Frame.Y + edit.Crop.Y*pp3Frame.Height,
+				Width:  edit.Crop.Width * pp3Frame.Width,
+				Height: edit.Crop.Height * pp3Frame.Height,
+			}
+			imgWidth = 1
+			imgHeight = 1
+			log.Printf("Converted user crop to PP3 pixels (B&W) for %s: (%.0f,%.0f,%.0f,%.0f)",
+				img.Filename, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+		} else if cameraCropMode && edit.Aspect != "free" {
+			edit.Crop = pp3Frame
+			imgWidth = 1
+			imgHeight = 1
+			log.Printf("Applied camera EXIF frame in PP3 space (B&W) for %s: (%.0f,%.0f,%.0f,%.0f)",
+				img.Filename, pp3Frame.X, pp3Frame.Y, pp3Frame.Width, pp3Frame.Height)
+		}
+
+	} else if edit.Crop != nil {
+		// STANDARD 4:3 IMAGE (B&W) with user crop
+		var err error
+		imgWidth, imgHeight, err = s.getImageDimensions(img.Path)
+		if err != nil {
+			log.Printf("Warning: failed to get image dimensions (B&W) for %s: %v (crop may not work)", img.Filename, err)
+		}
+		if imgWidth > 0 && imgHeight > 0 {
+			orientation := customexif.GetOrientation(img.Path)
+			if customexif.IsPortraitOrientation(orientation) && imgWidth > imgHeight {
+				imgWidth, imgHeight = imgHeight, imgWidth
+				log.Printf("Swapped dimensions for portrait orientation %d (B&W): %s now %dx%d",
+					orientation, img.Filename, imgWidth, imgHeight)
 			}
 		}
 	}
 
-	// If camera aspect ratio is selected OR image has non-4:3 aspect ratio, use EXIF crop frame
-	if (edit.Aspect == "camera" || hasNon43AspectRatio) && img.CropFrame != nil {
-		if edit.Crop == nil || (edit.Crop.X == 0 && edit.Crop.Y == 0 && edit.Crop.Width == 1 && edit.Crop.Height == 1) {
-			if useExifCropFrameDirectly {
-				// Use EXIF crop frame pixel coordinates directly
-				edit.Crop = &CropBox{
-					X:      float64(img.CropFrame.X),
-					Y:      float64(img.CropFrame.Y),
-					Width:  float64(img.CropFrame.Width),
-					Height: float64(img.CropFrame.Height),
-				}
+	// If user set a specific aspect ratio but crop data is null, auto-generate a centered crop
+	if edit.Crop == nil && edit.Aspect != "" && edit.Aspect != "free" && edit.Aspect != "camera" {
+		if hasNon43AspectRatio && img.CropFrame != nil {
+			// For non-4:3 images with user aspect override, generate crop within the camera frame
+			edit.Crop = s.generateUserCropWithinCameraFrame(edit.Aspect, img.CropFrame, img.Path)
+			if edit.Crop != nil {
 				imgWidth = 1
 				imgHeight = 1
-				log.Printf("Applied camera aspect ratio crop (B&W) for %s: using EXIF frame pixels (%d,%d,%d,%d)",
-					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height)
-			} else if imgWidth > 0 && imgHeight > 0 {
-				// Convert camera's EXIF crop frame to normalized crop box
-				edit.Crop = &CropBox{
-					X:      float64(img.CropFrame.X) / float64(imgWidth),
-					Y:      float64(img.CropFrame.Y) / float64(imgHeight),
-					Width:  float64(img.CropFrame.Width) / float64(imgWidth),
-					Height: float64(img.CropFrame.Height) / float64(imgHeight),
+				log.Printf("Auto-generated crop within camera frame (B&W) for %s: aspect=%s -> pixels (%.0f,%.0f,%.0f,%.0f)",
+					img.Filename, edit.Aspect, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+			}
+		} else {
+			// Standard path for 4:3 images
+			if imgWidth == 0 || imgHeight == 0 {
+				var dimErr error
+				imgWidth, imgHeight, dimErr = s.getImageDimensions(img.Path)
+				if dimErr != nil {
+					log.Printf("Warning: failed to get image dimensions for auto-crop (B&W) %s: %v", img.Filename, dimErr)
 				}
-				log.Printf("Applied camera aspect ratio crop (B&W profile) for %s: EXIF frame (%d,%d,%d,%d) -> normalized (%.3f,%.3f,%.3f,%.3f)",
-					img.Filename, img.CropFrame.X, img.CropFrame.Y, img.CropFrame.Width, img.CropFrame.Height,
-					edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height)
+				if imgWidth > 0 && imgHeight > 0 {
+					orientation := customexif.GetOrientation(img.Path)
+					if customexif.IsPortraitOrientation(orientation) && imgWidth > imgHeight {
+						imgWidth, imgHeight = imgHeight, imgWidth
+					}
+				}
+			}
+			if imgWidth > 0 && imgHeight > 0 {
+				edit.Crop = generateCropFromAspect(edit.Aspect, imgWidth, imgHeight)
+				if edit.Crop != nil {
+					log.Printf("Auto-generated crop (B&W) for %s: aspect=%s -> normalized (%.3f,%.3f,%.3f,%.3f) for image %dx%d",
+						img.Filename, edit.Aspect, edit.Crop.X, edit.Crop.Y, edit.Crop.Width, edit.Crop.Height, imgWidth, imgHeight)
+				}
 			}
 		}
 	}
@@ -2414,6 +2521,272 @@ func (s *Server) getImageDimensions(imagePath string) (width, height int, err er
 	}
 
 	return 0, 0, fmt.Errorf("failed to extract dimensions from %s", imagePath)
+}
+
+// getRawSensorDimensions gets the full RAW sensor dimensions directly from the file
+// using exiftool, bypassing the sidecar JPG which may have different (camera-cropped) dimensions.
+func (s *Server) getRawSensorDimensions(imagePath string) (width, height int, err error) {
+	cmd := exec.Command("exiftool", "-ImageWidth", "-ImageHeight", "-s3", imagePath)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("exiftool failed for %s: %v", imagePath, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) >= 2 {
+		fmt.Sscanf(lines[0], "%d", &width)
+		fmt.Sscanf(lines[1], "%d", &height)
+		if width > 0 && height > 0 {
+			return width, height, nil
+		}
+	}
+
+	return 0, 0, fmt.Errorf("failed to parse RAW sensor dimensions from %s", imagePath)
+}
+
+// generateUserCropWithinCameraFrame computes PP3 crop coordinates (in post-orientation pixel space)
+// for a user's aspect ratio override applied within a camera's EXIF crop frame.
+// This is a Server method that reads orientation and sensor dimensions from the image file.
+func (s *Server) generateUserCropWithinCameraFrame(
+	userAspect string,
+	frame *CropFrameInfo,
+	imagePath string,
+) *CropBox {
+	orientation := customexif.GetOrientation(imagePath)
+
+	sensorW, sensorH := 0, 0
+	if customexif.IsPortraitOrientation(orientation) {
+		var err error
+		sensorW, sensorH, err = s.getRawSensorDimensions(imagePath)
+		if err != nil {
+			log.Printf("Warning: failed to get raw sensor dimensions for %s: %v", imagePath, err)
+			// Fallback: estimate sensor from crop frame (assume 4:3 sensor)
+			if frame.X+frame.Width > frame.Y+frame.Height {
+				sensorW = frame.X + frame.Width
+				sensorH = sensorW * 3 / 4
+			} else {
+				sensorH = frame.Y + frame.Height
+				sensorW = sensorH * 4 / 3
+			}
+			log.Printf("Estimated sensor dimensions: %dx%d", sensorW, sensorH)
+		}
+	}
+
+	result := computeUserCropWithinCameraFrame(userAspect, frame, orientation, sensorW, sensorH)
+	if result != nil {
+		log.Printf("Generated user crop within camera frame: aspect=%s orientation=%d -> PP3 pixels (%.0f,%.0f,%.0f,%.0f)",
+			userAspect, orientation, result.X, result.Y, result.Width, result.Height)
+	}
+	return result
+}
+
+// computeUserCropWithinCameraFrame is the pure logic for computing a user's aspect ratio crop
+// within a camera's EXIF crop frame, properly handling orientation transforms.
+// Parameters:
+//   - userAspect: desired aspect ratio string (e.g., "3:4", "1:1", "16:9")
+//   - frame: camera's EXIF crop frame in sensor space
+//   - orientation: EXIF orientation value (1-8)
+//   - sensorW, sensorH: full RAW sensor dimensions (only needed for portrait orientations 5-8)
+//
+// Returns pixel coordinates for direct use in PP3 (with imgWidth=1, imgHeight=1), or nil if
+// the user's aspect matches the frame's display aspect (no additional crop needed).
+func computeUserCropWithinCameraFrame(
+	userAspect string,
+	frame *CropFrameInfo,
+	orientation int,
+	sensorW, sensorH int,
+) *CropBox {
+	isPortrait := customexif.IsPortraitOrientation(orientation)
+
+	// Determine the displayed frame dimensions
+	// For portrait images, the frame W/H are swapped in display
+	var displayFrameW, displayFrameH int
+	if isPortrait {
+		displayFrameW = frame.Height
+		displayFrameH = frame.Width
+	} else {
+		displayFrameW = frame.Width
+		displayFrameH = frame.Height
+	}
+
+	// Generate normalized crop within displayed frame dimensions
+	userCrop := generateCropFromAspect(userAspect, displayFrameW, displayFrameH)
+	if userCrop == nil {
+		// User's aspect matches frame aspect — no additional crop needed
+		return nil
+	}
+
+	// Compute pixel coordinates of user's crop within the display frame
+	pixInFrameX := userCrop.X * float64(displayFrameW)
+	pixInFrameY := userCrop.Y * float64(displayFrameH)
+	pixInFrameW := userCrop.Width * float64(displayFrameW)
+	pixInFrameH := userCrop.Height * float64(displayFrameH)
+
+	if !isPortrait {
+		// Landscape: sensor coords = display coords, just add frame offset
+		return &CropBox{
+			X:      float64(frame.X) + pixInFrameX,
+			Y:      float64(frame.Y) + pixInFrameY,
+			Width:  pixInFrameW,
+			Height: pixInFrameH,
+		}
+	}
+
+	// Portrait: transform camera frame offset to post-orientation (display) space
+	var frameDispX, frameDispY int
+	switch orientation {
+	case 6: // 90° CW rotation (most common portrait)
+		frameDispX = sensorH - frame.Y - frame.Height
+		frameDispY = frame.X
+	case 8: // 270° CW / 90° CCW rotation
+		frameDispX = frame.Y
+		frameDispY = sensorW - frame.X - frame.Width
+	case 5: // Transposed
+		frameDispX = frame.Y
+		frameDispY = frame.X
+	case 7: // Transverse
+		frameDispX = sensorH - frame.Y - frame.Height
+		frameDispY = sensorW - frame.X - frame.Width
+	default:
+		frameDispX = sensorH - frame.Y - frame.Height
+		frameDispY = frame.X
+	}
+
+	return &CropBox{
+		X:      float64(frameDispX) + pixInFrameX,
+		Y:      float64(frameDispY) + pixInFrameY,
+		Width:  pixInFrameW,
+		Height: pixInFrameH,
+	}
+}
+
+// transformFrameToPostOrientation converts an EXIF sensor-space crop frame to
+// post-orientation PP3 pixel coordinates. RawTherapee PP3 uses post-orientation
+// coordinates, so we must transform the sensor-space EXIF frame for portrait images.
+func transformFrameToPostOrientation(frame *CropFrameInfo, orientation int, sensorW, sensorH int) *CropBox {
+	isPortrait := customexif.IsPortraitOrientation(orientation)
+
+	if !isPortrait {
+		// Landscape: sensor coords = PP3 coords (no transformation needed)
+		return &CropBox{
+			X:      float64(frame.X),
+			Y:      float64(frame.Y),
+			Width:  float64(frame.Width),
+			Height: float64(frame.Height),
+		}
+	}
+
+	// Portrait orientations: transform sensor to post-orientation space
+	// Width/Height swap for portrait (sensor W becomes display H and vice versa)
+	var pp3X, pp3Y int
+	switch orientation {
+	case 6: // 90° CW rotation (most common portrait)
+		pp3X = sensorH - frame.Y - frame.Height
+		pp3Y = frame.X
+	case 8: // 270° CW / 90° CCW rotation
+		pp3X = frame.Y
+		pp3Y = sensorW - frame.X - frame.Width
+	case 5: // Transposed
+		pp3X = frame.Y
+		pp3Y = frame.X
+	case 7: // Transverse
+		pp3X = sensorH - frame.Y - frame.Height
+		pp3Y = sensorW - frame.X - frame.Width
+	default:
+		pp3X = sensorH - frame.Y - frame.Height
+		pp3Y = frame.X
+	}
+
+	return &CropBox{
+		X:      float64(pp3X),
+		Y:      float64(pp3Y),
+		Width:  float64(frame.Height), // Width/Height swap for portrait
+		Height: float64(frame.Width),
+	}
+}
+
+// isReciprocalAspect checks if aspect string 'a' is the reciprocal of aspect string 'b'.
+// For example, "9:16" is the reciprocal of "16:9".
+func isReciprocalAspect(a, b string) bool {
+	parts := strings.Split(b, ":")
+	if len(parts) == 2 {
+		return a == parts[1]+":"+parts[0]
+	}
+	return false
+}
+
+// generateCropFromAspect creates a centered crop box for a given aspect ratio string
+// Returns nil if the aspect ratio doesn't require cropping (e.g., matches image aspect)
+func generateCropFromAspect(aspect string, imgWidth, imgHeight int) *CropBox {
+	// Parse aspect ratio string
+	ratios := map[string]float64{
+		"1:1":  1.0,
+		"3:2":  3.0 / 2.0,
+		"2:3":  2.0 / 3.0,
+		"4:3":  4.0 / 3.0,
+		"3:4":  3.0 / 4.0,
+		"16:9": 16.0 / 9.0,
+		"9:16": 9.0 / 16.0,
+		"5:4":  5.0 / 4.0,
+		"4:5":  4.0 / 5.0,
+		"7:6":  7.0 / 6.0,
+		"6:7":  6.0 / 7.0,
+		"6:5":  6.0 / 5.0,
+		"5:6":  5.0 / 6.0,
+		"7:5":  7.0 / 5.0,
+		"5:7":  5.0 / 7.0,
+	}
+
+	targetRatio, ok := ratios[aspect]
+	if !ok {
+		// Try parsing "W:H" format
+		parts := strings.Split(aspect, ":")
+		if len(parts) == 2 {
+			w, h := 0.0, 0.0
+			fmt.Sscanf(parts[0], "%f", &w)
+			fmt.Sscanf(parts[1], "%f", &h)
+			if w > 0 && h > 0 {
+				targetRatio = w / h
+			} else {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	}
+
+	imgAspect := float64(imgWidth) / float64(imgHeight)
+
+	// Check if image already matches the target aspect (within 1% tolerance)
+	diff := imgAspect - targetRatio
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff/targetRatio < 0.01 {
+		return nil // No crop needed
+	}
+
+	// Calculate centered crop
+	var cropW, cropH float64
+	if imgAspect > targetRatio {
+		// Image is wider than target — constrain by height
+		cropH = 1.0
+		cropW = (targetRatio / imgAspect)
+	} else {
+		// Image is taller than target — constrain by width
+		cropW = 1.0
+		cropH = (imgAspect / targetRatio)
+	}
+
+	cropX := (1.0 - cropW) / 2.0
+	cropY := (1.0 - cropH) / 2.0
+
+	return &CropBox{
+		X:      cropX,
+		Y:      cropY,
+		Width:  cropW,
+		Height: cropH,
+	}
 }
 
 // applyEditsToPP3 modifies PP3 content with edit settings

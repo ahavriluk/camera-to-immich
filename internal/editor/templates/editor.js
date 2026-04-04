@@ -783,6 +783,9 @@ function updateRotation(value) {
         updateRotationCropPreview(edit.rotation);
     }
     
+    // Re-constrain crop area to the new inscribed rectangle
+    constrainCropToRotation();
+    
     markTouched();
     applyPreview(edit);
     saveEdits();
@@ -795,23 +798,73 @@ function resetRotation() {
     document.getElementById('rotation-value').textContent = '0°';
     document.getElementById('grid-lines').classList.remove('visible');
     document.getElementById('rotation-crop-overlay').classList.remove('visible');
+    
+    // Re-constrain crop area (bounds expand back to full image)
+    constrainCropToRotation();
+    
     applyPreview(edit);
     saveEdits();
+}
+
+// Re-constrain the crop area to fit within the inscribed rectangle
+// Called when rotation changes so the crop doesn't extend into empty corners
+function constrainCropToRotation() {
+    const cropOverlay = document.getElementById('crop-overlay');
+    if (!cropOverlay.classList.contains('active')) return;
+    
+    const cropArea = document.getElementById('crop-area');
+    const bounds = getImageBounds();
+    
+    let left = cropArea.offsetLeft;
+    let top = cropArea.offsetTop;
+    let width = cropArea.offsetWidth;
+    let height = cropArea.offsetHeight;
+    
+    // Clamp dimensions to not exceed inscribed bounds
+    if (width > bounds.width) width = bounds.width;
+    if (height > bounds.height) height = bounds.height;
+    
+    // Clamp position
+    if (left < bounds.left) left = bounds.left;
+    if (top < bounds.top) top = bounds.top;
+    if (left + width > bounds.right) left = bounds.right - width;
+    if (top + height > bounds.bottom) top = bounds.bottom - height;
+    
+    cropArea.style.left = left + 'px';
+    cropArea.style.top = top + 'px';
+    cropArea.style.width = width + 'px';
+    cropArea.style.height = height + 'px';
+    
+    updateCropData();
+}
+
+// Calculate the inscribed rectangle scale factor for a given rotation angle.
+// When an image is rotated, the largest axis-aligned rectangle (same aspect ratio)
+// that fits inside the rotated image is smaller than the original.
+// Returns scale factor (0..1) to multiply original dimensions by.
+function getRotationScaleFactor(w, h, angleDegrees) {
+    const angleRad = Math.abs(angleDegrees) * Math.PI / 180;
+    if (angleRad < 0.001) return 1;
+    
+    const sinA = Math.sin(angleRad);
+    const cosA = Math.cos(angleRad);
+    
+    // For inscribed rect with half-dims (sw/2, sh/2) maintaining aspect ratio:
+    // s * (w * cos(θ) + h * sin(θ)) <= w  →  s <= w / (w*cos + h*sin)
+    // s * (w * sin(θ) + h * cos(θ)) <= h  →  s <= h / (w*sin + h*cos)
+    const s1 = w / (w * cosA + h * sinA);
+    const s2 = h / (w * sinA + h * cosA);
+    return Math.min(s1, s2);
 }
 
 // Calculate the inscribed rectangle after rotation
 // When an image is rotated, we need to crop to avoid showing empty corners
 function updateRotationCropPreview(angleDegrees) {
     const img = document.getElementById('preview-image');
-    const overlay = document.getElementById('rotation-crop-overlay');
     const cropBox = document.getElementById('rotation-crop-box');
     const container = document.getElementById('preview-container');
     
     if (!img.complete || img.naturalWidth === 0) return;
-    
-    const angleRad = Math.abs(angleDegrees) * Math.PI / 180;
-    const sinA = Math.sin(angleRad);
-    const cosA = Math.cos(angleRad);
     
     // Get image dimensions (before rotation)
     const imgWidth = img.offsetWidth;
@@ -825,58 +878,9 @@ function updateRotationCropPreview(angleDegrees) {
     const imgCenterX = imgRect.left + imgRect.width / 2 - containerRect.left;
     const imgCenterY = imgRect.top + imgRect.height / 2 - containerRect.top;
     
-    // Calculate the inscribed rectangle that fits inside the rotated image
-    // When a rectangle (w x h) is rotated by angle θ, the largest inscribed
-    // axis-aligned rectangle with the SAME aspect ratio has dimensions:
-    //
-    // For the corners of the inscribed rectangle to touch the edges of the
-    // rotated original rectangle, we need to scale down such that:
-    // new_w = w * cos(θ) - h * sin(θ) (won't work for all cases)
-    //
-    // Better approach: calculate how much the inscribed rectangle needs to
-    // shrink so its corners fit within the rotated parallelogram
-    
-    let cropWidth, cropHeight;
-    
-    if (angleRad < 0.001) {
-        cropWidth = imgWidth;
-        cropHeight = imgHeight;
-    } else {
-        // The inscribed rectangle with same aspect ratio as original
-        // For angle θ, the scale factor is:
-        // s = 1 / (cos(θ) + sin(θ) * max(w/h, h/w))
-        // But we want same aspect ratio, so:
-        // s = cos(θ) - sin(θ) * tan(θ) for the limiting dimension
-        
-        // Simpler correct formula:
-        // The width of inscribed rect = (W * cos(θ) - H * |sin(θ)|) when W > H
-        // But to maintain aspect ratio, we use a uniform scale:
-        
-        const w = imgWidth;
-        const h = imgHeight;
-        
-        // Maximum inscribed rectangle maintaining original aspect ratio
-        // Scale factor: the inscribed rect corners must be within the rotated rect
-        // For a point at (±w/2, ±h/2) in the inscribed rect,
-        // after considering rotation of the outer rect, we need:
-        // |x * cos(θ) + y * sin(θ)| <= W/2
-        // |x * sin(θ) - y * cos(θ)| <= H/2
-        
-        // For inscribed rect with half-dims (sw/2, sh/2):
-        // (sw/2) * cos(θ) + (sh/2) * sin(θ) <= w/2
-        // (sw/2) * sin(θ) + (sh/2) * cos(θ) <= h/2
-        
-        // With s as scale factor and maintaining aspect ratio (sw = s*w, sh = s*h):
-        // s * (w * cos(θ) + h * sin(θ)) <= w  →  s <= w / (w*cos + h*sin)
-        // s * (w * sin(θ) + h * cos(θ)) <= h  →  s <= h / (w*sin + h*cos)
-        
-        const s1 = w / (w * cosA + h * sinA);
-        const s2 = h / (w * sinA + h * cosA);
-        const scaleFactor = Math.min(s1, s2);
-        
-        cropWidth = w * scaleFactor;
-        cropHeight = h * scaleFactor;
-    }
+    const scaleFactor = getRotationScaleFactor(imgWidth, imgHeight, angleDegrees);
+    const cropWidth = imgWidth * scaleFactor;
+    const cropHeight = imgHeight * scaleFactor;
     
     // Center the crop box on the image center
     const cropLeft = imgCenterX - cropWidth / 2;
@@ -920,14 +924,12 @@ function initializeCropArea(aspect) {
     
     if (!img.complete) return;
     
-    // Get image position relative to container
-    const containerRect = container.getBoundingClientRect();
-    const imgRect = img.getBoundingClientRect();
-    
-    const imgLeft = imgRect.left - containerRect.left;
-    const imgTop = imgRect.top - containerRect.top;
-    const imgWidth = imgRect.width;
-    const imgHeight = imgRect.height;
+    // Get un-rotated image bounds (safe when CSS rotation is applied)
+    const bounds = getImageBounds();
+    const imgLeft = bounds.left;
+    const imgTop = bounds.top;
+    const imgWidth = bounds.width;
+    const imgHeight = bounds.height;
     
     // Calculate crop dimensions based on aspect ratio
     let cropWidth, cropHeight;
@@ -997,14 +999,12 @@ function restoreCropArea(edit) {
     
     if (!img.complete) return;
     
-    // Get image position relative to container
-    const containerRect = container.getBoundingClientRect();
-    const imgRect = img.getBoundingClientRect();
-    
-    const imgLeft = imgRect.left - containerRect.left;
-    const imgTop = imgRect.top - containerRect.top;
-    const imgWidth = imgRect.width;
-    const imgHeight = imgRect.height;
+    // Get un-rotated image bounds (safe when CSS rotation is applied)
+    const bounds = getImageBounds();
+    const imgLeft = bounds.left;
+    const imgTop = bounds.top;
+    const imgWidth = bounds.width;
+    const imgHeight = bounds.height;
     
     // Convert normalized values back to pixels
     const cropLeft = imgLeft + (edit.crop.x * imgWidth);
@@ -1037,19 +1037,41 @@ function resetCrop() {
 // Crop drag functionality
 let cropDragState = null;
 
+// Get the effective image bounds for cropping, relative to the container.
+// When the image is rotated, returns the inscribed rectangle (the safe area
+// that avoids empty corners), not the full image bounds.
 function getImageBounds() {
     const img = document.getElementById('preview-image');
     const container = document.getElementById('preview-container');
     const containerRect = container.getBoundingClientRect();
     const imgRect = img.getBoundingClientRect();
     
+    // Use offset dimensions (not affected by CSS transforms)
+    const w = img.offsetWidth;
+    const h = img.offsetHeight;
+    
+    // Center is accurate even when rotated (rotation is around center)
+    const centerX = imgRect.left + imgRect.width / 2 - containerRect.left;
+    const centerY = imgRect.top + imgRect.height / 2 - containerRect.top;
+    
+    // When rotated, constrain to the inscribed rectangle
+    const edit = getEdit(state.currentIndex);
+    const rotation = edit ? edit.rotation : 0;
+    const scale = getRotationScaleFactor(w, h, rotation);
+    
+    const effectiveW = w * scale;
+    const effectiveH = h * scale;
+    
+    const left = centerX - effectiveW / 2;
+    const top = centerY - effectiveH / 2;
+    
     return {
-        left: imgRect.left - containerRect.left,
-        top: imgRect.top - containerRect.top,
-        width: imgRect.width,
-        height: imgRect.height,
-        right: imgRect.left - containerRect.left + imgRect.width,
-        bottom: imgRect.top - containerRect.top + imgRect.height
+        left: left,
+        top: top,
+        width: effectiveW,
+        height: effectiveH,
+        right: left + effectiveW,
+        bottom: top + effectiveH
     };
 }
 
@@ -1194,18 +1216,15 @@ function initCropDragHandlers() {
 }
 
 function updateCropData() {
-    const img = document.getElementById('preview-image');
-    const container = document.getElementById('preview-container');
     const cropArea = document.getElementById('crop-area');
     const edit = getEdit(state.currentIndex);
     
-    const containerRect = container.getBoundingClientRect();
-    const imgRect = img.getBoundingClientRect();
-    
-    const imgLeft = imgRect.left - containerRect.left;
-    const imgTop = imgRect.top - containerRect.top;
-    const imgWidth = imgRect.width;
-    const imgHeight = imgRect.height;
+    // Get un-rotated image bounds (safe when CSS rotation is applied)
+    const bounds = getImageBounds();
+    const imgLeft = bounds.left;
+    const imgTop = bounds.top;
+    const imgWidth = bounds.width;
+    const imgHeight = bounds.height;
     
     edit.crop = {
         x: (cropArea.offsetLeft - imgLeft) / imgWidth,
