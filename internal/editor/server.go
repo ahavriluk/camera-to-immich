@@ -2189,15 +2189,13 @@ func (s *Server) handleProcessFilmScans(w http.ResponseWriter, r *http.Request) 
 	successCount := 0
 	errorCount := 0
 
-	quality := s.processConfig.JPEGQuality
-	if quality == 0 {
-		// Film scans from labs are typically very high quality (98-100).
-		// Use 100 as default to maximize quality preservation during rotation/crop.
-		// Note: Go's image/jpeg encoder at Q100 still produces smaller files than
-		// lab tools (libjpeg-turbo, Lightroom) due to different quantization tables
-		// and Huffman coding. The visual quality is perceptually identical.
-		quality = 100
-	}
+	// Film scans from labs are typically very high quality (98-100).
+	// Always use Q100 for film scan mode to maximize quality preservation during
+	// rotation/crop, regardless of the general jpeg_quality config setting.
+	// Note: Go's image/jpeg encoder at Q100 still produces smaller files than
+	// lab tools (libjpeg-turbo, Lightroom) due to different quantization tables
+	// and Huffman coding. The visual quality is perceptually identical.
+	quality := 100
 
 	for frameIdx, item := range items {
 		outputFilename := strings.TrimSuffix(item.img.Filename, filepath.Ext(item.img.Filename)) + ".jpg"
