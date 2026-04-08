@@ -48,6 +48,8 @@ func main() {
 	stateInfo := flag.Bool("state-info", false, "Show state file information and exit")
 	editorMode := flag.Bool("editor", false, "Launch web editor for image preview and adjustment")
 	editorPort := flag.String("editor-port", "8080", "Port for the web editor server")
+	filmMode := flag.Bool("film", false, "Film scan mode: enables date assignment, JPG processing, roll grouping")
+	sourcePath := flag.String("source", "", "Source folder path (for film scan mode, bypasses drive detection)")
 	retryUpload := flag.Bool("retry-upload", false, "Upload existing processed files from output directory without reprocessing")
 	noUploadUI := flag.Bool("no-upload-ui", false, "Suppress immich-go UI during upload (quiet mode)")
 	clearCache := flag.Bool("clear-cache", false, "Clear the preview image cache and exit")
@@ -93,7 +95,7 @@ func main() {
 
 	// Editor mode - early exit path that doesn't require full config validation
 	if *editorMode {
-		runEditor(*configPath, *driveLabel, *outputDir, *profilePath, *editorPort, *limit, *skipUpload)
+		runEditor(*configPath, *driveLabel, *outputDir, *profilePath, *editorPort, *limit, *skipUpload, *filmMode, *sourcePath)
 		os.Exit(0)
 	}
 
@@ -1141,9 +1143,14 @@ func getProfileTag(profilePath string) string {
 }
 
 // runEditor launches the web-based image editor
-func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limit int, skipUpload bool) {
-	fmt.Println("🖼  Camera-to-Immich Web Editor")
-	fmt.Println("================================")
+func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limit int, skipUpload bool, filmMode bool, sourcePath string) {
+	if filmMode {
+		fmt.Println("🎞️  Camera-to-Immich Film Scan Editor")
+		fmt.Println("======================================")
+	} else {
+		fmt.Println("🖼  Camera-to-Immich Web Editor")
+		fmt.Println("================================")
+	}
 
 	// Load config for defaults
 	cfgPath := configPath
@@ -1175,18 +1182,48 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 		cfg.SkipUpload = true
 	}
 
-	// Check required external tools
-	if err := checkRequiredTools(cfg); err != nil {
-		log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+	// Determine source path
+	var imageSourcePath string
+
+	if filmMode && sourcePath != "" {
+		// Film scan mode with explicit source path — bypass drive detection
+		// Validate source path exists
+		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+			log.Fatalf("Source path does not exist: %s", sourcePath)
+		}
+		imageSourcePath = sourcePath
+		fmt.Printf("✓ Using source folder: %s\n", imageSourcePath)
+	} else if sourcePath != "" {
+		// Source path provided without film mode — use it directly
+		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+			log.Fatalf("Source path does not exist: %s", sourcePath)
+		}
+		imageSourcePath = sourcePath
+		fmt.Printf("✓ Using source folder: %s\n", imageSourcePath)
+	} else {
+		// Standard mode — find camera drive
+		// Check required external tools (only for standard mode, film mode doesn't need RawTherapee)
+		if !filmMode {
+			if err := checkRequiredTools(cfg); err != nil {
+				log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+			}
+		}
+
+		fmt.Printf("Searching for drive '%s'...\n", cfg.DriveLabel)
+		driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
+		if err != nil {
+			log.Fatalf("Camera drive not found: %v\nUse --drive to specify a different drive label, or --list-drives to see available drives", err)
+		}
+		fmt.Printf("✓ Found drive at: %s\n", driveInfo.Path)
+		imageSourcePath = driveInfo.Path
 	}
 
-	// Find camera drive
-	fmt.Printf("Searching for drive '%s'...\n", cfg.DriveLabel)
-	driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
-	if err != nil {
-		log.Fatalf("Camera drive not found: %v\nUse --drive to specify a different drive label, or --list-drives to see available drives", err)
+	// In film mode, only check for exiftool (needed for date stamping)
+	if filmMode {
+		if _, err := exec.LookPath("exiftool"); err != nil {
+			log.Fatalf("exiftool is required for film scan mode.\nDownload from https://exiftool.org/")
+		}
 	}
-	fmt.Printf("✓ Found drive at: %s\n", driveInfo.Path)
 
 	// Ensure output directory
 	if cfg.OutputDirectory == "" {
@@ -1204,19 +1241,20 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 
 	// Create editor server
 	serverConfig := editor.ServerConfig{
-		SourcePath:    driveInfo.Path,
+		SourcePath:    imageSourcePath,
 		OutputDir:     cfg.OutputDirectory,
 		ProfilePath:   cfg.PP3ProfilePath,
 		BWProfilePath: cfg.PP3BWProfilePath,
 		RawExtensions: cfg.GetRawExtensionsMap(),
 		EditsPath:     filepath.Join(cfg.OutputDirectory, "edits.json"),
 		Limit:         limit,
+		FilmScanMode:  filmMode,
 		ProcessConfig: editor.ProcessConfig{
 			ConvertToDNG:       cfg.ConvertToDNG,
 			DNGConverterPath:   cfg.DNGConverterPath,
 			RawTherapeeExe:     cfg.RawTherapeeExecutable,
 			JPEGQuality:        cfg.JPEGQuality,
-			SkipUpload:         skipUpload,
+			SkipUpload:         skipUpload || cfg.SkipUpload,
 			Workers:            cfg.Workers,
 			UploadCameraJPGs:   cfg.UploadCameraJPGs,
 			PP3BWProfilePath:   cfg.PP3BWProfilePath,
@@ -1230,6 +1268,7 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 			NoUploadUI:         cfg.NoUploadUI,
 			CleanupAfterUpload: cfg.CleanupAfterUpload,
 			StatePath:          statePath,
+			FilmScanMode:       filmMode,
 		},
 	}
 

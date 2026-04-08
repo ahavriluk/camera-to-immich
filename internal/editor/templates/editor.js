@@ -10,7 +10,12 @@ const state = {
     isLoading: false,
     useApi: true, // Set to false to use demo images for preview
     currentFilter: 'all', // 'all', 'edited', 'unedited', 'skipped'
+    filmScanMode: false, // Film scan mode (date assignment, roll grouping)
+    sortMode: 'folder', // 'folder' (original) or 'date' (by shooting date)
 };
+
+// Roll colors for visual grouping in film scan mode
+const ROLL_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16'];
 
 // WebGL Exposure Renderer - GPU-accelerated exposure preview
 // Performs exposure compensation in linear light space with filmic highlight rolloff,
@@ -239,6 +244,8 @@ async function init() {
     
     try {
         if (state.useApi) {
+            // Load config from API (check for film scan mode)
+            await loadConfigFromApi();
             // Load images from API
             await loadImagesFromApi();
             // Load edits from API
@@ -262,6 +269,29 @@ async function init() {
         }
     }
     
+    // Apply film scan mode UI changes
+    if (state.filmScanMode) {
+        document.body.classList.add('film-scan-mode');
+        // Show film scan specific controls
+        const dateControls = document.getElementById('date-controls');
+        if (dateControls) dateControls.style.display = 'block';
+        // Show sort toggle
+        const sortToggle = document.getElementById('sort-toggle');
+        if (sortToggle) sortToggle.style.display = 'flex';
+        // Hide exposure controls (not applicable for film scans)
+        const exposureControls = document.getElementById('exposure-controls');
+        if (exposureControls) exposureControls.style.display = 'none';
+        // Hide B&W toggle (not applicable for film scans)
+        const bwControls = document.getElementById('bw-controls');
+        if (bwControls) bwControls.style.display = 'none';
+        // Hide global Color/B&W preset toggle in header
+        const presetToggle = document.querySelector('.preset-toggle');
+        if (presetToggle) presetToggle.style.display = 'none';
+        // Update title
+        const logo = document.querySelector('.logo');
+        if (logo) logo.textContent = '🎞️ Film Scan Editor';
+    }
+    
     // Render the grid with loaded images
     renderImageGrid();
     updateStats();
@@ -274,6 +304,22 @@ async function init() {
     applyFilter();
     
     showLoading(false);
+}
+
+// Load config from API
+async function loadConfigFromApi() {
+    try {
+        const response = await fetch('/api/config');
+        if (response.ok) {
+            const config = await response.json();
+            state.filmScanMode = config.filmScanMode || false;
+            if (state.filmScanMode) {
+                console.log('Film scan mode enabled');
+            }
+        }
+    } catch (error) {
+        console.log('Failed to load config:', error);
+    }
 }
 
 // Load images from API
@@ -308,10 +354,24 @@ function renderImageGrid() {
     const grid = document.getElementById('image-grid');
     grid.innerHTML = ''; // Clear existing content
     
+    let currentRoll = null;
+    
     state.images.forEach((img, index) => {
+        // In film scan mode, insert roll separator headers
+        if (state.filmScanMode && img.rollName && img.rollName !== currentRoll) {
+            currentRoll = img.rollName;
+            const separator = createRollSeparator(img.rollName, img.rollIndex);
+            grid.appendChild(separator);
+        }
+        
         const item = document.createElement('div');
         item.className = `grid-item ${getGridItemClass(index)}`;
         item.onclick = () => openModal(index);
+        
+        // In film scan mode, add roll color border
+        if (state.filmScanMode && typeof img.rollIndex === 'number') {
+            item.style.borderLeft = `3px solid ${ROLL_COLORS[img.rollIndex % ROLL_COLORS.length]}`;
+        }
         
         const imgEl = document.createElement('img');
         imgEl.src = img.thumbnailUrl;
@@ -324,8 +384,356 @@ function renderImageGrid() {
         
         item.appendChild(imgEl);
         item.appendChild(filename);
+        
+        // In film scan mode, show date badge if date is set
+        if (state.filmScanMode) {
+            const edit = state.edits[img.id];
+            const effectiveDate = getEffectiveDate(img);
+            if (effectiveDate) {
+                const dateBadge = document.createElement('span');
+                dateBadge.className = 'date-badge';
+                dateBadge.textContent = effectiveDate;
+                item.appendChild(dateBadge);
+            }
+            // Show segment start marker
+            if (edit && edit.segmentStart) {
+                const segmentMarker = document.createElement('span');
+                segmentMarker.className = 'segment-marker';
+                segmentMarker.textContent = '📅';
+                segmentMarker.title = 'Date segment start';
+                item.appendChild(segmentMarker);
+            }
+        }
+        
         grid.appendChild(item);
     });
+}
+
+// === Film Scan Mode Helper Functions ===
+
+// Create a roll separator header element
+function createRollSeparator(rollName, rollIndex) {
+    const separator = document.createElement('div');
+    separator.className = 'roll-separator';
+    separator.style.borderLeftColor = ROLL_COLORS[rollIndex % ROLL_COLORS.length];
+    
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'roll-name';
+    nameSpan.textContent = rollName;
+    
+    const dateSpan = document.createElement('span');
+    dateSpan.className = 'roll-date';
+    const rollDates = getRollDateSummary(rollName);
+    if (rollDates) {
+        dateSpan.textContent = '📅 ' + rollDates;
+    } else {
+        dateSpan.textContent = '📅 No date set';
+        dateSpan.classList.add('unset');
+    }
+    
+    const countSpan = document.createElement('span');
+    countSpan.className = 'roll-count';
+    const rollImages = state.images.filter(img => img.rollName === rollName);
+    countSpan.textContent = `${rollImages.length} frames`;
+    
+    // Set Date button for the whole roll
+    const setDateBtn = document.createElement('button');
+    setDateBtn.className = 'roll-set-date-btn';
+    setDateBtn.textContent = 'Set Date';
+    setDateBtn.onclick = (e) => {
+        e.stopPropagation();
+        promptRollDate(rollName);
+    };
+    
+    // Reverse button
+    const reverseBtn = document.createElement('button');
+    reverseBtn.className = 'roll-reverse-btn';
+    reverseBtn.textContent = '⇅ Reverse';
+    reverseBtn.title = 'Reverse frame order in this roll';
+    reverseBtn.onclick = (e) => {
+        e.stopPropagation();
+        reverseRoll(rollName);
+    };
+    
+    separator.appendChild(nameSpan);
+    separator.appendChild(dateSpan);
+    separator.appendChild(countSpan);
+    separator.appendChild(setDateBtn);
+    separator.appendChild(reverseBtn);
+    
+    return separator;
+}
+
+// Get a summary of dates assigned to a roll
+function getRollDateSummary(rollName) {
+    const rollImages = state.images.filter(img => img.rollName === rollName);
+    const dates = new Set();
+    for (const img of rollImages) {
+        const date = getEffectiveDate(img);
+        if (date) dates.add(date);
+    }
+    if (dates.size === 0) return null;
+    const sorted = Array.from(dates).sort();
+    if (sorted.length === 1) return sorted[0];
+    return sorted[0] + ' — ' + sorted[sorted.length - 1];
+}
+
+// Get the effective shooting date for an image (inherited from segment start)
+function getEffectiveDate(img) {
+    const edit = state.edits[img.id];
+    if (edit && edit.shootingDate) return edit.shootingDate;
+    
+    // Find the nearest segment start date before this image in the same roll
+    const rollImages = state.images.filter(i => i.rollName === img.rollName);
+    const idx = rollImages.findIndex(i => i.id === img.id);
+    if (idx < 0) return null;
+    
+    // Walk backwards to find nearest segment start or first image with a date
+    for (let i = idx - 1; i >= 0; i--) {
+        const prevEdit = state.edits[rollImages[i].id];
+        if (prevEdit && prevEdit.shootingDate) {
+            return prevEdit.shootingDate;
+        }
+    }
+    return null;
+}
+
+// Prompt user to set a date for an entire roll
+function promptRollDate(rollName) {
+    const currentDate = getRollDateSummary(rollName) || '';
+    const dateStr = prompt(`Set shooting date for "${rollName}":\n\nFormat: YYYY-MM-DD\n(This will set the date on the first frame and propagate to all frames in this roll)`, currentDate.split(' — ')[0] || '');
+    if (!dateStr) return;
+    
+    // Validate date format
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        alert('Invalid date format. Please use YYYY-MM-DD');
+        return;
+    }
+    
+    // Apply date to first frame of the roll and propagate
+    const rollImages = state.images.filter(img => img.rollName === rollName);
+    if (rollImages.length === 0) return;
+    
+    // Set the date on the first frame as a segment start
+    const firstImg = rollImages[0];
+    if (!state.edits[firstImg.id]) {
+        state.edits[firstImg.id] = createDefaultEdit();
+    }
+    state.edits[firstImg.id].shootingDate = dateStr;
+    state.edits[firstImg.id].segmentStart = true;
+    
+    // Clear any dates on subsequent frames (they inherit from the first)
+    for (let i = 1; i < rollImages.length; i++) {
+        const edit = state.edits[rollImages[i].id];
+        if (edit && !edit.segmentStart) {
+            // Don't clear segment starts — those are intentional date boundaries
+            delete edit.shootingDate;
+        }
+    }
+    
+    saveEdits();
+    
+    // Re-sort if in date mode
+    if (state.sortMode === 'date') {
+        sortImagesByDate();
+    }
+    
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    applyFilter();
+}
+
+// Reverse the order of images in a roll
+function reverseRoll(rollName) {
+    const rollStart = state.images.findIndex(img => img.rollName === rollName);
+    if (rollStart < 0) return;
+    
+    let rollEnd = rollStart;
+    while (rollEnd < state.images.length && state.images[rollEnd].rollName === rollName) {
+        rollEnd++;
+    }
+    
+    const rollSlice = state.images.slice(rollStart, rollEnd);
+    rollSlice.reverse();
+    state.images.splice(rollStart, rollEnd - rollStart, ...rollSlice);
+    
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    applyFilter();
+}
+
+// Create a default edit object
+function createDefaultEdit() {
+    return {
+        exposure: 0,
+        rotation: 0,
+        crop: null,
+        aspect: 'free',
+        bw: state.globalPreset === 'bw',
+        skip: false,
+        touched: false,
+        shootingDate: '',
+        segmentStart: false
+    };
+}
+
+// Sort images by shooting date (rolls ordered by their earliest date)
+function sortImagesByDate() {
+    // Group images by roll
+    const rollMap = new Map();
+    for (const img of state.images) {
+        const roll = img.rollName || '__none__';
+        if (!rollMap.has(roll)) rollMap.set(roll, []);
+        rollMap.get(roll).push(img);
+    }
+    
+    // Get earliest date per roll
+    function getRollEarliestDate(rollName) {
+        const imgs = rollMap.get(rollName) || [];
+        let earliest = null;
+        for (const img of imgs) {
+            const date = getEffectiveDate(img);
+            if (date && (!earliest || date < earliest)) {
+                earliest = date;
+            }
+        }
+        return earliest;
+    }
+    
+    // Sort rolls by earliest date (undated rolls go to end)
+    const rollNames = Array.from(rollMap.keys());
+    rollNames.sort((a, b) => {
+        const dateA = getRollEarliestDate(a) || 'zzzz';
+        const dateB = getRollEarliestDate(b) || 'zzzz';
+        return dateA.localeCompare(dateB);
+    });
+    
+    // Rebuild images array in sorted roll order
+    state.images = [];
+    for (const rollName of rollNames) {
+        state.images.push(...rollMap.get(rollName));
+    }
+}
+
+// Sort toggle handler
+function setSortMode(mode) {
+    state.sortMode = mode;
+    document.querySelectorAll('.sort-toggle button').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.sort === mode);
+    });
+    
+    if (mode === 'date') {
+        sortImagesByDate();
+    } else {
+        // Restore original folder order — re-fetch from API
+        loadImagesFromApi().then(() => {
+            renderImageGrid();
+            updateAllThumbnailFilters();
+            applyFilter();
+        });
+        return;
+    }
+    
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    applyFilter();
+}
+
+// Set shooting date for current image from modal
+function updateShootingDate(dateStr) {
+    const img = state.images[state.currentIndex];
+    if (!img) return;
+    
+    const edit = getEdit(state.currentIndex);
+    edit.shootingDate = dateStr;
+    
+    // If this is the first frame in the roll or has no prior date, mark as segment start
+    const rollImages = state.images.filter(i => i.rollName === img.rollName);
+    const rollIdx = rollImages.findIndex(i => i.id === img.id);
+    if (rollIdx === 0 || edit.segmentStart) {
+        edit.segmentStart = true;
+    }
+    
+    markTouched();
+    saveEdits();
+}
+
+// Copy date from previous image
+function copyDateFromPrevious() {
+    if (state.currentIndex <= 0) return;
+    const prevImg = state.images[state.currentIndex - 1];
+    const prevDate = getEffectiveDate(prevImg);
+    if (prevDate) {
+        const dateInput = document.getElementById('shooting-date');
+        if (dateInput) {
+            dateInput.value = prevDate;
+            updateShootingDate(prevDate);
+        }
+    }
+}
+
+// Apply date to rest of roll from current image
+function applyDateToRestOfRoll() {
+    const currentImg = state.images[state.currentIndex];
+    const edit = state.edits[currentImg.id];
+    if (!edit || !edit.shootingDate) {
+        alert('Set a date on this image first');
+        return;
+    }
+    
+    const rollImages = state.images.filter(i => i.rollName === currentImg.rollName);
+    const idx = rollImages.findIndex(i => i.id === currentImg.id);
+    
+    // Apply to all subsequent images in the roll (that don't have their own segment start)
+    for (let i = idx + 1; i < rollImages.length; i++) {
+        const imgEdit = state.edits[rollImages[i].id];
+        if (imgEdit && imgEdit.segmentStart) break; // Stop at next segment boundary
+        // Clear any manual date — they'll inherit
+        if (imgEdit) {
+            delete imgEdit.shootingDate;
+        }
+    }
+    
+    saveEdits();
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    applyFilter();
+}
+
+// Mark current image as a new date segment start
+function markDateBoundary() {
+    const edit = getEdit(state.currentIndex);
+    edit.segmentStart = true;
+    
+    // Prompt for date
+    const currentDate = edit.shootingDate || getEffectiveDate(state.images[state.currentIndex]) || '';
+    const dateStr = prompt('Set date for this new segment:', currentDate);
+    if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        edit.shootingDate = dateStr;
+        markTouched();
+        saveEdits();
+        
+        // Update the date input in the modal
+        const dateInput = document.getElementById('shooting-date');
+        if (dateInput) dateInput.value = dateStr;
+        
+        renderImageGrid();
+        updateAllThumbnailFilters();
+        applyFilter();
+    }
+}
+
+// Clear date from current image
+function clearDate() {
+    const edit = getEdit(state.currentIndex);
+    edit.shootingDate = '';
+    edit.segmentStart = false;
+    const dateInput = document.getElementById('shooting-date');
+    if (dateInput) dateInput.value = '';
+    saveEdits();
+    renderImageGrid();
+    updateAllThumbnailFilters();
+    applyFilter();
 }
 
 // Show/hide loading overlay
@@ -612,7 +1020,22 @@ function openModal(index) {
     const edit = getEdit(index);
     
     document.getElementById('modal').classList.add('active');
-    document.getElementById('modal-filename').textContent = img.filename;
+    
+    // Update filename with roll info in film scan mode
+    if (state.filmScanMode && img.rollName) {
+        document.getElementById('modal-filename').textContent = `${img.filename} (${img.rollName})`;
+    } else {
+        document.getElementById('modal-filename').textContent = img.filename;
+    }
+    
+    // Update date controls in film scan mode
+    if (state.filmScanMode) {
+        const dateInput = document.getElementById('shooting-date');
+        if (dateInput) {
+            const effectiveDate = edit.shootingDate || getEffectiveDate(img) || '';
+            dateInput.value = effectiveDate;
+        }
+    }
     
     const previewImg = document.getElementById('preview-image');
     previewImg.src = img.previewUrl;
@@ -704,6 +1127,20 @@ function closeModal() {
     if (img) {
         img.style.visibility = 'visible';
         img.style.filter = '';
+    }
+    
+    // In film scan mode, re-sort and re-render grid when closing modal
+    // (dates may have changed, affecting sort order)
+    if (state.filmScanMode && state.sortMode === 'date') {
+        sortImagesByDate();
+        renderImageGrid();
+        updateAllThumbnailFilters();
+        applyFilter();
+    } else if (state.filmScanMode) {
+        // Even in folder mode, re-render to update date badges
+        renderImageGrid();
+        updateAllThumbnailFilters();
+        applyFilter();
     }
 }
 
