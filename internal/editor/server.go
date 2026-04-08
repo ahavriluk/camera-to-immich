@@ -132,7 +132,8 @@ type ProcessConfig struct {
 	ImmichServerURL    string   // Immich server URL
 	ImmichAPIKey       string   // Immich API key
 	ImmichAlbum        string   // Optional album name
-	ImmichTags         []string // Tags to apply
+	ImmichTags         []string // Tags to apply (normal mode)
+	FilmScanTags       []string // Tags to apply (film scan mode, used instead of ImmichTags)
 	TagWithProfileName bool     // Tag uploads with profile name
 	NoUploadUI         bool     // Suppress immich-go UI during upload
 
@@ -2286,25 +2287,12 @@ func (s *Server) handleProcessFilmScans(w http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				log.Printf("Failed to initialize Immich uploader: %v", err)
 			} else {
-				// Build tags: "Film" + film stock names from roll folder names
+				// Build tags: "Film" + configured film_scan_tags
+				// Film stock names are NOT auto-extracted because they get applied
+				// globally to all images (not per-roll), which is incorrect when
+				// multiple film stocks are present.
 				tags := []string{"Film"}
-
-				// Extract unique film stock names from roll names
-				// Roll names like "Roll1 Colorplus200" → "Colorplus200"
-				// Roll names like "Roll2 Gold200" → "Gold200"
-				filmStocks := make(map[string]bool)
-				for _, rollName := range rollOrder {
-					stock := extractFilmStock(rollName)
-					if stock != "" {
-						filmStocks[stock] = true
-					}
-				}
-				for stock := range filmStocks {
-					tags = append(tags, stock)
-				}
-
-				// Add any configured tags
-				tags = append(tags, s.processConfig.ImmichTags...)
+				tags = append(tags, s.processConfig.FilmScanTags...)
 
 				log.Printf("Upload tags: %v", tags)
 
@@ -2525,17 +2513,19 @@ func clampInt(v, min, max int) int {
 }
 
 // extractFilmStock extracts the film stock name from a roll folder name.
+// It returns only the first word after the roll prefix that contains letters,
+// ignoring subsequent numeric lab reference numbers.
 // Examples:
 //
-//	"Roll1 Colorplus200" → "Colorplus200"
-//	"Roll2 Gold200" → "Gold200"
-//	"Roll 3 - Kodak Gold 200" → "Kodak Gold 200"
+//	"Roll1 Colorplus200 35 08825" → "Colorplus200"
+//	"Roll2 Gold200 35 08826" → "Gold200"
+//	"Roll 3 - Portra400" → "Portra400"
 //	"MyRoll" → "" (no recognizable pattern)
 func extractFilmStock(rollName string) string {
 	// Try to find film stock after "Roll" prefix patterns
 	name := strings.TrimSpace(rollName)
 
-	// Pattern: "RollN <stock>" or "Roll N <stock>" or "Roll_N <stock>"
+	// Pattern: "RollN <stock> [extra lab numbers...]"
 	// Remove leading "Roll" with optional number
 	lower := strings.ToLower(name)
 	if strings.HasPrefix(lower, "roll") {
@@ -2544,7 +2534,12 @@ func extractFilmStock(rollName string) string {
 		rest = strings.TrimLeft(rest, "0123456789")
 		rest = strings.TrimLeft(rest, " _-")
 		if rest != "" {
-			return strings.TrimSpace(rest)
+			// Take only the first word (film stock name)
+			// Subsequent words are typically lab reference numbers
+			parts := strings.Fields(rest)
+			if len(parts) > 0 {
+				return parts[0]
+			}
 		}
 	}
 

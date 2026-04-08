@@ -1264,6 +1264,7 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 			ImmichAPIKey:       cfg.ImmichAPIKey,
 			ImmichAlbum:        cfg.ImmichAlbum,
 			ImmichTags:         cfg.ImmichTags,
+			FilmScanTags:       cfg.FilmScanTags,
 			TagWithProfileName: cfg.TagWithProfileName,
 			NoUploadUI:         cfg.NoUploadUI,
 			CleanupAfterUpload: cfg.CleanupAfterUpload,
