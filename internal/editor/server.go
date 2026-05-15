@@ -2287,12 +2287,10 @@ func (s *Server) handleProcessFilmScans(w http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				log.Printf("Failed to initialize Immich uploader: %v", err)
 			} else {
-				// Build tags: "Film" + configured film_scan_tags
-				// Film stock names are NOT auto-extracted because they get applied
-				// globally to all images (not per-roll), which is incorrect when
-				// multiple film stocks are present.
-				tags := []string{"Film"}
-				tags = append(tags, s.processConfig.FilmScanTags...)
+				// Tags come exclusively from film_scan_tags config setting.
+				// No hardcoded tags are added.
+				tags := make([]string, len(s.processConfig.FilmScanTags))
+				copy(tags, s.processConfig.FilmScanTags)
 
 				log.Printf("Upload tags: %v", tags)
 

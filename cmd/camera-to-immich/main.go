@@ -15,6 +15,7 @@ import (
 	"github.com/ohavrylyuk/camera-to-immich/internal/config"
 	"github.com/ohavrylyuk/camera-to-immich/internal/drive"
 	"github.com/ohavrylyuk/camera-to-immich/internal/editor"
+	customexif "github.com/ohavrylyuk/camera-to-immich/internal/exif"
 	"github.com/ohavrylyuk/camera-to-immich/internal/processor"
 	"github.com/ohavrylyuk/camera-to-immich/internal/scanner"
 	"github.com/ohavrylyuk/camera-to-immich/internal/state"
@@ -454,9 +455,21 @@ func run(cfg *config.Config, verbose bool) error {
 
 // runWithRAWProcessing handles the workflow when RAW processing is enabled
 func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
-	// Filter unprocessed RAW files using time-based high-water mark
+	// Filter unprocessed RAW files using EXIF capture time (authoritative).
+	// File mtime can be touched by OS/card readers/AV scans, so we always
+	// validate candidates against EXIF DateTimeOriginal to avoid re-uploading
+	// already-processed photos whose mtime was bumped.
 	lastProcessedTime := appState.GetLastProcessedTime()
-	newRAWFiles := scanner.FilterNewFilesWithTime(scanResult.RAWFiles, nil, lastProcessedTime)
+	preCount := len(scanResult.RAWFiles)
+	newRAWFiles := scanner.FilterNewFilesWithCaptureTime(
+		scanResult.RAWFiles,
+		lastProcessedTime,
+		customexif.GetDateTimeOriginalWithFallback,
+	)
+	if !lastProcessedTime.IsZero() && preCount != len(newRAWFiles) {
+		logInfo("Filtered %d already-processed RAW files (by EXIF capture time, high-water mark: %s)",
+			preCount-len(newRAWFiles), lastProcessedTime.Format("2006-01-02 15:04:05"))
+	}
 
 	if len(newRAWFiles) == 0 {
 		logSuccess("No new RAW files to process!")
@@ -784,9 +797,14 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			}
 		}
 
-		// Update high-water mark with file's actual modification time
-		fileModTime := time.Unix(result.rawFile.ModTime, 0)
-		appState.MarkProcessed(fileModTime)
+		// Update high-water mark using EXIF capture time (authoritative);
+		// FilterNewFilesWithCaptureTime already populated CaptureTime for
+		// surviving files. Falls back to ModTime if CaptureTime unavailable.
+		fileTime := time.Unix(result.rawFile.CaptureTime, 0)
+		if result.rawFile.CaptureTime == 0 {
+			fileTime = time.Unix(result.rawFile.ModTime, 0)
+		}
+		appState.MarkProcessed(fileTime)
 	}
 
 	// Log total processing time
@@ -919,9 +937,21 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
 	logInfo("RAW processing disabled - uploading JPG files only")
 
-	// Filter unprocessed JPG files using time-based high-water mark
+	// Filter unprocessed JPG files using EXIF capture time (authoritative).
+	// File mtime can be touched by OS/card readers/AV scans, so we always
+	// validate candidates against EXIF DateTimeOriginal to avoid re-uploading
+	// already-processed photos whose mtime was bumped.
 	lastProcessedTime := appState.GetLastProcessedTime()
-	newJPGFiles := scanner.FilterNewFilesWithTime(scanResult.JPGFiles, nil, lastProcessedTime)
+	preCount := len(scanResult.JPGFiles)
+	newJPGFiles := scanner.FilterNewFilesWithCaptureTime(
+		scanResult.JPGFiles,
+		lastProcessedTime,
+		customexif.GetDateTimeOriginalWithFallback,
+	)
+	if !lastProcessedTime.IsZero() && preCount != len(newJPGFiles) {
+		logInfo("Filtered %d already-processed JPG files (by EXIF capture time, high-water mark: %s)",
+			preCount-len(newJPGFiles), lastProcessedTime.Format("2006-01-02 15:04:05"))
+	}
 
 	if len(newJPGFiles) == 0 {
 		logSuccess("No new JPG files to upload!")
@@ -959,12 +989,25 @@ func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scann
 			logSuccess("Uploaded: %s", jpgFile.Name)
 		}
 
-		// Update high-water mark with file's actual modification time
-		fileModTime := time.Unix(jpgFile.ModTime, 0)
-		appState.MarkProcessed(fileModTime)
+		// Update high-water mark using EXIF capture time (authoritative);
+		// FilterNewFilesWithCaptureTime already populated CaptureTime for
+		// surviving files. Falls back to ModTime if CaptureTime unavailable.
+		fileTime := time.Unix(jpgFile.CaptureTime, 0)
+		if jpgFile.CaptureTime == 0 {
+			fileTime = time.Unix(jpgFile.ModTime, 0)
+		}
+		appState.MarkProcessed(fileTime)
+
+		// Save state incrementally so that if the upload is interrupted,
+		// already-uploaded files are not re-uploaded on the next run.
+		// (UploadFile spawns immich-go per file, so this is slow already —
+		// the small extra cost of a state write per file is negligible.)
+		if err := appState.Save(); err != nil {
+			logError("Failed to save state after %s: %v", jpgFile.Name, err)
+		}
 	}
 
-	// Save state
+	// Final state save (in case the loop body's incremental save was skipped)
 	if err := appState.Save(); err != nil {
 		return fmt.Errorf("failed to save state: %v", err)
 	}
