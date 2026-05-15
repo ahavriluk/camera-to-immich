@@ -23,6 +23,12 @@
                 <button onclick="setFilter('skipped')" data-filter="skipped">Skipped</button>
             </div>
 
+            <!-- Sort toggle (film scan mode only, hidden by default) -->
+            <div class="sort-toggle" id="sort-toggle" style="display: none;">
+                <button class="active" onclick="setSortMode('folder')" data-sort="folder">📁 Folder</button>
+                <button onclick="setSortMode('date')" data-sort="date">📅 Date</button>
+            </div>
+
             <button class="btn-reset-all" onclick="resetAllEdits()" title="Reset all modified images back to original settings">↺ Reset All Edits</button>
             
             <div class="preset-toggle">
@@ -158,8 +164,8 @@
             
             <!-- Controls (on right) -->
             <div class="controls">
-                <!-- Exposure -->
-                <div class="control-group">
+                <!-- Exposure (hidden in film scan mode) -->
+                <div class="control-group" id="exposure-controls">
                     <div class="control-label-row">
                         <label>Exposure (EV)</label>
                         <button class="reset-btn" onclick="resetExposure()" title="Reset exposure">↺</button>
@@ -239,14 +245,30 @@
                     </div>
                 </div>
                 
-                <!-- B&W Toggle -->
-                <div class="control-group">
+                <!-- B&W Toggle (hidden in film scan mode) -->
+                <div class="control-group" id="bw-controls">
                     <div class="control-label-row">
                         <label>Output Style</label>
                     </div>
                     <div class="bw-toggle">
                         <button class="color-btn active" onclick="setBW(false)" id="color-btn">Color</button>
                         <button class="bw-btn" onclick="setBW(true)" id="bw-btn">B&W</button>
+                    </div>
+                </div>
+                
+                <!-- Shooting Date (Film Scan Mode only, hidden by default) -->
+                <div class="control-group" id="date-controls" style="display: none;">
+                    <div class="control-label-row">
+                        <label>Shooting Date</label>
+                        <button class="reset-btn" onclick="clearDate()" title="Clear date">↺</button>
+                    </div>
+                    <div class="date-row">
+                        <input type="date" id="shooting-date" onchange="updateShootingDate(this.value)">
+                        <button class="date-action-btn" onclick="copyDateFromPrevious()" title="Same date as previous image">← Same</button>
+                    </div>
+                    <div class="date-actions">
+                        <button class="date-action-btn" onclick="applyDateToRestOfRoll()">Apply to rest of roll →</button>
+                        <button class="date-action-btn" onclick="markDateBoundary()">★ New date here</button>
                     </div>
                 </div>
                 

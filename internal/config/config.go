@@ -43,6 +43,7 @@ type Config struct {
 	ImmichAPIKey     string   `json:"immich_api_key"`    // Immich API key
 	ImmichAlbum      string   `json:"immich_album"`      // Optional album name
 	ImmichTags       []string `json:"immich_tags"`       // Additional tags for all uploads
+	FilmScanTags     []string `json:"film_scan_tags"`    // Additional tags for film scan uploads (used instead of immich_tags in film mode)
 
 	// Processing options
 	ProcessRAWFiles        bool `json:"process_raw_files"`         // Process RAW files with RawTherapee (if false, only upload JPGs)

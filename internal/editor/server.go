@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	"image/jpeg"
 	_ "image/png"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -47,6 +49,8 @@ type ImageInfo struct {
 	AspectRatio        string          `json:"aspectRatio"`       // Camera aspect ratio (e.g., "4:3", "3:2", "16:9")
 	DisplayAspectRatio string          `json:"displayAspectRatio"` // Aspect ratio adjusted for EXIF orientation (e.g., "3:4" for portrait 4:3)
 	CropFrame          *CropFrameInfo  `json:"cropFrame"`         // Optional crop frame from EXIF
+	RollName           string          `json:"rollName,omitempty"`  // Film scan: subfolder/roll name
+	RollIndex          int             `json:"rollIndex,omitempty"` // Film scan: 0-based index of the roll (for color coding)
 }
 
 // CropFrameInfo represents crop coordinates from camera EXIF data
@@ -59,13 +63,15 @@ type CropFrameInfo struct {
 
 // EditData represents edit settings for a single image
 type EditData struct {
-	Exposure float64  `json:"exposure"` // EV adjustment (-2 to +2)
-	Rotation float64  `json:"rotation"` // Degrees (-15 to +15)
-	Crop     *CropBox `json:"crop"`     // Crop coordinates (normalized 0-1)
-	Aspect   string   `json:"aspect"`   // Aspect ratio constraint
-	BW       bool     `json:"bw"`       // Black & white
-	Skip     bool     `json:"skip"`     // Skip this image
-	Touched  bool     `json:"touched"`  // Has been edited
+	Exposure     float64  `json:"exposure"`               // EV adjustment (-2 to +2)
+	Rotation     float64  `json:"rotation"`               // Degrees (-15 to +15)
+	Crop         *CropBox `json:"crop"`                   // Crop coordinates (normalized 0-1)
+	Aspect       string   `json:"aspect"`                 // Aspect ratio constraint
+	BW           bool     `json:"bw"`                     // Black & white
+	Skip         bool     `json:"skip"`                   // Skip this image
+	Touched      bool     `json:"touched"`                // Has been edited
+	ShootingDate string   `json:"shootingDate,omitempty"` // Film scan: shooting date "YYYY-MM-DD"
+	SegmentStart bool     `json:"segmentStart,omitempty"` // Film scan: marks start of new date segment within a roll
 }
 
 // CropBox represents normalized crop coordinates
@@ -94,6 +100,7 @@ type Server struct {
 	rawExts       map[string]bool
 	sourcePath    string // Path to scan for images (stored for rescan)
 	imageLimit    int    // Limit number of images (stored for rescan)
+	filmScanMode  bool   // Film scan mode enabled
 	mu            sync.RWMutex
 	mux           *http.ServeMux
 
@@ -125,24 +132,29 @@ type ProcessConfig struct {
 	ImmichServerURL    string   // Immich server URL
 	ImmichAPIKey       string   // Immich API key
 	ImmichAlbum        string   // Optional album name
-	ImmichTags         []string // Tags to apply
+	ImmichTags         []string // Tags to apply (normal mode)
+	FilmScanTags       []string // Tags to apply (film scan mode, used instead of ImmichTags)
 	TagWithProfileName bool     // Tag uploads with profile name
 	NoUploadUI         bool     // Suppress immich-go UI during upload
 
 	// State and cleanup
 	CleanupAfterUpload bool   // Delete processed files after upload
 	StatePath          string // Path to state file
+
+	// Film scan mode
+	FilmScanMode bool // Enable film scan mode (JPG processing, date stamping, roll grouping)
 }
 
 // ServerConfig contains configuration for the editor server
 type ServerConfig struct {
-	SourcePath    string          // Path to scan for images (camera drive)
+	SourcePath    string          // Path to scan for images (camera drive or film scan folder)
 	OutputDir     string          // Directory for output files
 	ProfilePath   string          // Base PP3 profile to modify (color)
 	BWProfilePath string          // B&W PP3 profile path (optional)
 	RawExtensions map[string]bool // RAW file extensions
 	EditsPath     string          // Path to save edits JSON
 	Limit         int             // Limit number of images to load (0 = no limit)
+	FilmScanMode  bool            // Enable film scan mode (date assignment, JPG processing, roll grouping)
 
 	// Processing options
 	ProcessConfig ProcessConfig
@@ -158,6 +170,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		rawExts:       config.RawExtensions,
 		sourcePath:    config.SourcePath,
 		imageLimit:    config.Limit,
+		filmScanMode:  config.FilmScanMode,
 		jpgMap:        make(map[string]string),
 		mux:           http.NewServeMux(),
 		processConfig: config.ProcessConfig,
@@ -186,8 +199,14 @@ func NewServer(config ServerConfig) (*Server, error) {
 
 	// Scan for images
 	if config.SourcePath != "" {
-		if err := s.scanImages(config.SourcePath, config.Limit); err != nil {
-			return nil, fmt.Errorf("failed to scan images: %v", err)
+		if s.filmScanMode {
+			if err := s.scanFilmImages(config.SourcePath); err != nil {
+				return nil, fmt.Errorf("failed to scan film images: %v", err)
+			}
+		} else {
+			if err := s.scanImages(config.SourcePath, config.Limit); err != nil {
+				return nil, fmt.Errorf("failed to scan images: %v", err)
+			}
 		}
 	}
 
@@ -203,7 +222,132 @@ func (s *Server) RescanImages() error {
 	if s.sourcePath == "" {
 		return fmt.Errorf("no source path configured")
 	}
+	if s.filmScanMode {
+		return s.scanFilmImages(s.sourcePath)
+	}
 	return s.scanImages(s.sourcePath, s.imageLimit)
+}
+
+// scanFilmImages scans a folder with subfolders representing film rolls.
+// Each subfolder is treated as a roll. JPG/JPEG/PNG/TIFF files are loaded.
+// No state filtering is applied — all images are loaded.
+func (s *Server) scanFilmImages(sourcePath string) error {
+	log.Printf("Scanning for film scans in: %s", sourcePath)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.images = make([]ImageInfo, 0)
+
+	// Read top-level entries in source path
+	entries, err := os.ReadDir(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to read source directory: %v", err)
+	}
+
+	// Collect rolls (subfolders) and also check for loose files at root
+	type rollInfo struct {
+		name  string
+		path  string
+		index int
+	}
+
+	var rolls []rollInfo
+	var looseFiles []os.DirEntry
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// Skip hidden directories
+			if strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			rolls = append(rolls, rollInfo{
+				name:  entry.Name(),
+				path:  filepath.Join(sourcePath, entry.Name()),
+				index: len(rolls),
+			})
+		} else {
+			// Loose file at the root level
+			looseFiles = append(looseFiles, entry)
+		}
+	}
+
+	// If no subfolders found, treat root as a single roll
+	if len(rolls) == 0 && len(looseFiles) > 0 {
+		rolls = append(rolls, rollInfo{
+			name:  filepath.Base(sourcePath),
+			path:  sourcePath,
+			index: 0,
+		})
+		looseFiles = nil // Will be picked up by roll scan
+	}
+
+	// Scan each roll
+	for _, roll := range rolls {
+		rollEntries, err := os.ReadDir(roll.path)
+		if err != nil {
+			log.Printf("Warning: Failed to read roll directory %s: %v", roll.path, err)
+			continue
+		}
+
+		for _, entry := range rollEntries {
+			if entry.IsDir() {
+				continue
+			}
+
+			name := entry.Name()
+			// Skip hidden files
+			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "._") {
+				continue
+			}
+
+			ext := strings.ToUpper(filepath.Ext(name))
+			if ext != ".JPG" && ext != ".JPEG" && ext != ".PNG" && ext != ".TIFF" && ext != ".TIF" {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			baseName := strings.TrimSuffix(name, filepath.Ext(name))
+			filePath := filepath.Join(roll.path, name)
+
+			// Use roll-scoped ID to avoid collisions between rolls
+			imageID := fmt.Sprintf("%s/%s", roll.name, baseName)
+
+			imgInfo := ImageInfo{
+				ID:           imageID,
+				Filename:     name,
+				Path:         filePath,
+				BaseName:     baseName,
+				PreviewURL:   fmt.Sprintf("/api/images/%s/preview", imageID),
+				ThumbnailURL: fmt.Sprintf("/api/images/%s/thumbnail", imageID),
+				IsRAW:        false,
+				Size:         info.Size(),
+				ModTime:      info.ModTime().Unix(),
+				CaptureTime:  info.ModTime().Unix(), // No meaningful EXIF date for film scans
+				RollName:     roll.name,
+				RollIndex:    roll.index,
+			}
+
+			s.images = append(s.images, imgInfo)
+		}
+	}
+
+	log.Printf("Film scan: found %d images across %d rolls", len(s.images), len(rolls))
+	for _, roll := range rolls {
+		count := 0
+		for _, img := range s.images {
+			if img.RollName == roll.name {
+				count++
+			}
+		}
+		log.Printf("  Roll %d: %s (%d images)", roll.index+1, roll.name, count)
+	}
+
+	return nil
 }
 
 // scanImages scans the source path for images
@@ -442,6 +586,22 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("/api/shutdown", s.handleShutdown)
 	s.mux.HandleFunc("/api/cache", s.handleCache)
+	s.mux.HandleFunc("/api/config", s.handleConfig)
+}
+
+// handleConfig returns the editor configuration to the frontend
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	configData := map[string]interface{}{
+		"filmScanMode": s.filmScanMode,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(configData)
 }
 
 // GetCacheDir returns the path to the cache directory
@@ -665,14 +825,18 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 // handleImageFile serves preview/thumbnail for an image
 func (s *Server) handleImageFile(w http.ResponseWriter, r *http.Request) {
 	// Parse path: /api/images/{id}/{type}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/images/"), "/")
-	if len(parts) != 2 {
+	// For film scan mode, ID can contain slashes: /api/images/{roll}/{basename}/{type}
+	pathAfterPrefix := strings.TrimPrefix(r.URL.Path, "/api/images/")
+	parts := strings.Split(pathAfterPrefix, "/")
+	if len(parts) < 2 {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 
-	imageID := parts[0]
-	fileType := parts[1] // "preview" or "thumbnail"
+	// Last part is always the type (preview/thumbnail)
+	fileType := parts[len(parts)-1] // "preview" or "thumbnail"
+	// Everything before the last part is the image ID
+	imageID := strings.Join(parts[:len(parts)-1], "/")
 
 	// Find image
 	s.mu.RLock()
@@ -700,6 +864,11 @@ func (s *Server) handleImageFile(w http.ResponseWriter, r *http.Request) {
 	s.serveJPGPreview(w, r, img, fileType)
 }
 
+// sanitizeCacheID replaces path separators and unsafe characters in image IDs for use in cache filenames
+func sanitizeCacheID(id string) string {
+	return strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(id)
+}
+
 // serveRAWPreview generates and serves a preview for RAW files
 func (s *Server) serveRAWPreview(w http.ResponseWriter, r *http.Request, img *ImageInfo, fileType string) {
 	// Check if we have a cached preview
@@ -713,7 +882,8 @@ func (s *Server) serveRAWPreview(w http.ResponseWriter, r *http.Request, img *Im
 		maxSize = 1200
 	}
 
-	cachePath := filepath.Join(cacheDir, fmt.Sprintf("%s_%s_%d.jpg", img.ID, fileType, maxSize))
+	safeID := sanitizeCacheID(img.ID)
+	cachePath := filepath.Join(cacheDir, fmt.Sprintf("%s_%s_%d.jpg", safeID, fileType, maxSize))
 
 	// Check cache
 	if _, err := os.Stat(cachePath); err == nil {
@@ -1205,14 +1375,15 @@ func (s *Server) serveJPGPreview(w http.ResponseWriter, r *http.Request, img *Im
 	cacheDir := filepath.Join(s.outputDir, ".cache")
 	os.MkdirAll(cacheDir, 0755)
 
+	safeID := sanitizeCacheID(img.ID)
 	var maxSize int
 	var cacheFilename string
 	if fileType == "preview" {
 		maxSize = 1200
-		cacheFilename = fmt.Sprintf("%s_preview.jpg", img.ID)
+		cacheFilename = fmt.Sprintf("%s_preview.jpg", safeID)
 	} else {
 		maxSize = 300
-		cacheFilename = fmt.Sprintf("%s_thumb.jpg", img.ID)
+		cacheFilename = fmt.Sprintf("%s_thumb.jpg", safeID)
 	}
 
 	cachePath := filepath.Join(cacheDir, cacheFilename)
@@ -1335,6 +1506,12 @@ func (s *Server) saveEdits(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Film scan mode uses a completely different processing pipeline
+	if s.filmScanMode {
+		s.handleProcessFilmScans(w, r)
 		return
 	}
 
@@ -1891,6 +2068,484 @@ func (s *Server) handleProcess(w http.ResponseWriter, r *http.Request) {
 		"results":              processedResults,
 	})
 }
+// handleProcessFilmScans processes film scan images:
+// - Applies rotation/crop for edited images via Go image library
+// - Copies unedited images as-is
+// - Stamps EXIF DateTimeOriginal using exiftool
+// - Tags with "Film" + film stock name
+// - Uploads to Immich
+func (s *Server) handleProcessFilmScans(w http.ResponseWriter, r *http.Request) {
+	// Load edits
+	data, err := os.ReadFile(s.editsPath)
+	if err != nil {
+		http.Error(w, "No edits to process", http.StatusBadRequest)
+		return
+	}
+
+	var edits EditsFile
+	if err := json.Unmarshal(data, &edits); err != nil {
+		http.Error(w, "Invalid edits file", http.StatusInternalServerError)
+		return
+	}
+
+	// Group images by roll for date computation
+	type rollGroup struct {
+		images []*ImageInfo
+	}
+	rollMap := make(map[string]*rollGroup)
+	var rollOrder []string
+
+	s.mu.RLock()
+	for i := range s.images {
+		img := &s.images[i]
+		roll := img.RollName
+		if roll == "" {
+			roll = "__root__"
+		}
+		if _, exists := rollMap[roll]; !exists {
+			rollMap[roll] = &rollGroup{}
+			rollOrder = append(rollOrder, roll)
+		}
+		rollMap[roll].images = append(rollMap[roll].images, img)
+	}
+	s.mu.RUnlock()
+
+	// Compute effective date for each image (mirrors frontend getEffectiveDate logic)
+	effectiveDates := make(map[string]string) // imageID -> "YYYY-MM-DD"
+	for _, rollName := range rollOrder {
+		rg := rollMap[rollName]
+		var lastDate string
+		for _, img := range rg.images {
+			edit, hasEdit := edits.Edits[img.ID]
+			if hasEdit && edit.ShootingDate != "" {
+				lastDate = edit.ShootingDate
+			}
+			if lastDate != "" {
+				effectiveDates[img.ID] = lastDate
+			}
+		}
+	}
+
+	// Collect non-skipped images to process
+	type filmProcessItem struct {
+		img           *ImageInfo
+		edit          EditData
+		hasEdit       bool
+		effectiveDate string
+		isEdited      bool // rotation != 0 or crop != nil
+	}
+
+	var items []filmProcessItem
+	for _, rollName := range rollOrder {
+		rg := rollMap[rollName]
+		for _, img := range rg.images {
+			edit, hasEdit := edits.Edits[img.ID]
+			if hasEdit && edit.Skip {
+				continue
+			}
+			isEdited := false
+			if hasEdit && (edit.Rotation != 0 || edit.Crop != nil) {
+				isEdited = true
+			}
+			items = append(items, filmProcessItem{
+				img:           img,
+				edit:          edit,
+				hasEdit:       hasEdit,
+				effectiveDate: effectiveDates[img.ID],
+				isEdited:      isEdited,
+			})
+		}
+	}
+
+	if len(items) == 0 {
+		http.Error(w, "No images to process", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Film scan processing: %d images to process", len(items))
+
+	// Create output directory for processed files
+	// When skip-upload is set, use a persistent subdirectory so files can be inspected
+	var filmOutputDir string
+	if s.processConfig.SkipUpload {
+		filmOutputDir = filepath.Join(s.outputDir, "film-output")
+		if err := os.MkdirAll(filmOutputDir, 0755); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to create output directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("Film scan output (persistent, skip-upload): %s", filmOutputDir)
+	} else {
+		var err error
+		filmOutputDir, err = os.MkdirTemp("", "film-scan-output-*")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to create temp directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer os.RemoveAll(filmOutputDir)
+	}
+
+	// Process each image
+	processedResults := make(map[string]interface{})
+	var processedFiles []string
+	successCount := 0
+	errorCount := 0
+
+	// Film scans from labs are typically very high quality (98-100).
+	// Always use Q100 for film scan mode to maximize quality preservation during
+	// rotation/crop, regardless of the general jpeg_quality config setting.
+	// Note: Go's image/jpeg encoder at Q100 still produces smaller files than
+	// lab tools (libjpeg-turbo, Lightroom) due to different quantization tables
+	// and Huffman coding. The visual quality is perceptually identical.
+	quality := 100
+
+	for frameIdx, item := range items {
+		outputFilename := strings.TrimSuffix(item.img.Filename, filepath.Ext(item.img.Filename)) + ".jpg"
+		// Prefix with roll name to avoid collisions
+		safeRoll := strings.ReplaceAll(item.img.RollName, "/", "_")
+		safeRoll = strings.ReplaceAll(safeRoll, "\\", "_")
+		safeRoll = strings.ReplaceAll(safeRoll, " ", "_")
+		outputFilename = safeRoll + "_" + outputFilename
+		outputPath := filepath.Join(filmOutputDir, outputFilename)
+
+		var processErr error
+
+		if item.isEdited {
+			// Apply rotation/crop/exposure via Go image library
+			processErr = s.processFilmScanImage(item.img, item.edit, outputPath, quality)
+		} else {
+			// Copy original as-is
+			processErr = copyFile(item.img.Path, outputPath)
+		}
+
+		if processErr != nil {
+			log.Printf("Error processing %s: %v", item.img.Filename, processErr)
+			processedResults[item.img.Filename] = map[string]interface{}{
+				"status": "error",
+				"error":  processErr.Error(),
+			}
+			errorCount++
+			continue
+		}
+
+		// Stamp EXIF DateTimeOriginal using exiftool
+		if item.effectiveDate != "" {
+			// Compute timestamp: date + frame index offset (1 minute per frame for ordering)
+			dateTime := fmt.Sprintf("%s 12:%02d:00", item.effectiveDate, frameIdx%60)
+			// For > 60 frames, adjust hour
+			if frameIdx >= 60 {
+				hour := 12 + frameIdx/60
+				if hour > 23 {
+					hour = 23
+				}
+				dateTime = fmt.Sprintf("%s %02d:%02d:00", item.effectiveDate, hour, frameIdx%60)
+			}
+			exifDate := strings.ReplaceAll(dateTime, "-", ":")
+			// exiftool format: "YYYY:MM:DD HH:MM:SS"
+
+			cmd := exec.Command("exiftool",
+				"-overwrite_original",
+				fmt.Sprintf("-DateTimeOriginal=%s", exifDate),
+				fmt.Sprintf("-CreateDate=%s", exifDate),
+				outputPath,
+			)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("Warning: Failed to stamp EXIF date on %s: %v (output: %s)", outputFilename, err, string(output))
+			} else {
+				log.Printf("Stamped EXIF date %s on %s", dateTime, outputFilename)
+			}
+		}
+
+		processedFiles = append(processedFiles, outputPath)
+		processedResults[item.img.Filename] = map[string]interface{}{
+			"status": "success",
+			"output": outputFilename,
+			"date":   item.effectiveDate,
+			"edited": item.isEdited,
+		}
+		successCount++
+		log.Printf("Processed film scan: %s → %s (edited: %v, date: %s)", item.img.Filename, outputFilename, item.isEdited, item.effectiveDate)
+	}
+
+	log.Printf("Film scan processing complete: %d success, %d errors", successCount, errorCount)
+
+	// Upload to Immich
+	uploadCount := 0
+	if !s.processConfig.SkipUpload && len(processedFiles) > 0 {
+		if s.processConfig.ImmichServerURL == "" || s.processConfig.ImmichAPIKey == "" {
+			log.Printf("Skipping upload: Immich server URL or API key not configured")
+		} else {
+			log.Printf("Uploading %d film scan files to Immich...", len(processedFiles))
+
+			immichConfig := uploader.ImmichConfig{
+				ServerURL:    s.processConfig.ImmichServerURL,
+				APIKey:       s.processConfig.ImmichAPIKey,
+				Album:        s.processConfig.ImmichAlbum,
+				ShowProgress: !s.processConfig.NoUploadUI,
+			}
+
+			im, err := uploader.NewImmich(immichConfig)
+			if err != nil {
+				log.Printf("Failed to initialize Immich uploader: %v", err)
+			} else {
+				// Tags come exclusively from film_scan_tags config setting.
+				// No hardcoded tags are added.
+				tags := make([]string, len(s.processConfig.FilmScanTags))
+				copy(tags, s.processConfig.FilmScanTags)
+
+				log.Printf("Upload tags: %v", tags)
+
+				if err := im.UploadFolder(filmOutputDir, tags, false); err != nil {
+					log.Printf("Failed to upload film scan files: %v", err)
+				} else {
+					uploadCount = len(processedFiles)
+					log.Printf("Uploaded %d film scan files successfully", uploadCount)
+				}
+			}
+		}
+	} else if s.processConfig.SkipUpload {
+		log.Printf("Skipping upload (--skip-upload flag)")
+	}
+
+	// Cleanup cache for processed images
+	if successCount > 0 {
+		processedIDs := make([]string, 0, len(items))
+		for _, item := range items {
+			processedIDs = append(processedIDs, item.img.ID)
+		}
+		cacheFilesRemoved, cacheBytesFreed, err := s.CleanupProcessedCache(processedIDs)
+		if err != nil {
+			log.Printf("Warning: failed to cleanup cache: %v", err)
+		} else if cacheFilesRemoved > 0 {
+			log.Printf("Cleaned up cache: %d files, %.2f MB freed", cacheFilesRemoved, float64(cacheBytesFreed)/(1024*1024))
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "completed",
+		"processed": successCount,
+		"errors":    errorCount,
+		"uploaded":  uploadCount,
+		"results":   processedResults,
+	})
+}
+
+// processFilmScanImage applies rotation and crop to a film scan JPG
+// using Go's image library with affine transform + bilinear interpolation.
+//
+// Coordinate system:
+// - Rotation is applied around the image center
+// - When rotated, the frontend constrains crop to the "inscribed rectangle" —
+//   the largest axis-aligned rect (same aspect ratio) that fits inside the rotated image
+// - Crop coordinates (0-1) are normalized relative to the inscribed rectangle
+// - This function combines rotation + crop in a single pass for quality and performance
+func (s *Server) processFilmScanImage(img *ImageInfo, edit EditData, outputPath string, quality int) error {
+	// Open source image
+	srcFile, err := os.Open(img.Path)
+	if err != nil {
+		return fmt.Errorf("failed to open source image: %v", err)
+	}
+	defer srcFile.Close()
+
+	srcImg, _, err := image.Decode(srcFile)
+	if err != nil {
+		return fmt.Errorf("failed to decode source image: %v", err)
+	}
+
+	bounds := srcImg.Bounds()
+	w := float64(bounds.Dx())
+	h := float64(bounds.Dy())
+
+	angleRad := edit.Rotation * math.Pi / 180.0
+	hasRotation := math.Abs(edit.Rotation) > 0.001
+
+	// Compute inscribed rectangle scale factor (matches frontend getRotationScaleFactor)
+	// When rotated, the largest axis-aligned rectangle that fits without black corners
+	// is scaled down by this factor
+	scale := 1.0
+	if hasRotation {
+		sinA := math.Abs(math.Sin(angleRad))
+		cosA := math.Abs(math.Cos(angleRad))
+		s1 := w / (w*cosA + h*sinA)
+		s2 := h / (w*sinA + h*cosA)
+		scale = math.Min(s1, s2)
+	}
+
+	// Inscribed rectangle in original image pixel coordinates
+	inscribedW := w * scale
+	inscribedH := h * scale
+	inscribedX := (w - inscribedW) / 2.0
+	inscribedY := (h - inscribedH) / 2.0
+
+	// Determine the crop region within the inscribed rectangle
+	// Crop coordinates are normalized (0-1) relative to inscribed rect
+	var cropPixelX, cropPixelY, cropPixelW, cropPixelH float64
+	if edit.Crop != nil {
+		cropPixelX = inscribedX + edit.Crop.X*inscribedW
+		cropPixelY = inscribedY + edit.Crop.Y*inscribedH
+		cropPixelW = edit.Crop.Width * inscribedW
+		cropPixelH = edit.Crop.Height * inscribedH
+	} else {
+		// No explicit crop — use the full inscribed rectangle
+		cropPixelX = inscribedX
+		cropPixelY = inscribedY
+		cropPixelW = inscribedW
+		cropPixelH = inscribedH
+	}
+
+	// Output dimensions
+	outW := int(math.Round(cropPixelW))
+	outH := int(math.Round(cropPixelH))
+	if outW <= 0 || outH <= 0 {
+		return fmt.Errorf("invalid output dimensions: %dx%d", outW, outH)
+	}
+
+	output := image.NewRGBA(image.Rect(0, 0, outW, outH))
+
+	// Image center (rotation pivot)
+	cx := w / 2.0
+	cy := h / 2.0
+
+	// Precompute inverse rotation trig values
+	// To find which source pixel maps to each output pixel, we apply
+	// inverse rotation (rotate by -angle) around the image center
+	cosInv := math.Cos(-angleRad)
+	sinInv := math.Sin(-angleRad)
+
+	// Single-pass: for each output pixel, find the corresponding source pixel
+	for oy := 0; oy < outH; oy++ {
+		for ox := 0; ox < outW; ox++ {
+			// Map output pixel to position in original image coordinate space
+			// (within the crop region of the rotated view)
+			px := cropPixelX + (float64(ox)+0.5)*cropPixelW/float64(outW)
+			py := cropPixelY + (float64(oy)+0.5)*cropPixelH/float64(outH)
+
+			// Apply inverse rotation around image center to find source pixel
+			dx := px - cx
+			dy := py - cy
+			srcX := cx + dx*cosInv - dy*sinInv - 0.5
+			srcY := cy + dx*sinInv + dy*cosInv - 0.5
+
+			// Bilinear interpolation
+			output.Set(ox, oy, bilinearSample(srcImg, srcX, srcY, bounds))
+		}
+	}
+
+	// Write output JPEG
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+	defer outFile.Close()
+
+	writer := bufio.NewWriter(outFile)
+	if err := jpeg.Encode(writer, output, &jpeg.Options{Quality: quality}); err != nil {
+		return fmt.Errorf("failed to encode JPEG: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush output: %v", err)
+	}
+
+	return nil
+}
+
+// bilinearSample performs bilinear interpolation sampling from an image at non-integer coordinates.
+// Returns a transparent pixel for out-of-bounds coordinates.
+func bilinearSample(img image.Image, x, y float64, bounds image.Rectangle) color.Color {
+	x0 := int(math.Floor(x))
+	y0 := int(math.Floor(y))
+	x1 := x0 + 1
+	y1 := y0 + 1
+
+	// Fractional parts
+	fx := x - float64(x0)
+	fy := y - float64(y0)
+
+	// Clamp to image bounds
+	minX := bounds.Min.X
+	minY := bounds.Min.Y
+	maxX := bounds.Max.X - 1
+	maxY := bounds.Max.Y - 1
+
+	x0c := clampInt(x0, minX, maxX)
+	y0c := clampInt(y0, minY, maxY)
+	x1c := clampInt(x1, minX, maxX)
+	y1c := clampInt(y1, minY, maxY)
+
+	// Sample four neighboring pixels
+	r00, g00, b00, a00 := img.At(x0c, y0c).RGBA()
+	r10, g10, b10, a10 := img.At(x1c, y0c).RGBA()
+	r01, g01, b01, a01 := img.At(x0c, y1c).RGBA()
+	r11, g11, b11, a11 := img.At(x1c, y1c).RGBA()
+
+	// Bilinear weights
+	w00 := (1 - fx) * (1 - fy)
+	w10 := fx * (1 - fy)
+	w01 := (1 - fx) * fy
+	w11 := fx * fy
+
+	// Interpolate each channel (values are 16-bit from RGBA())
+	r := uint16(float64(r00)*w00 + float64(r10)*w10 + float64(r01)*w01 + float64(r11)*w11)
+	g := uint16(float64(g00)*w00 + float64(g10)*w10 + float64(g01)*w01 + float64(g11)*w11)
+	b := uint16(float64(b00)*w00 + float64(b10)*w10 + float64(b01)*w01 + float64(b11)*w11)
+	a := uint16(float64(a00)*w00 + float64(a10)*w10 + float64(a01)*w01 + float64(a11)*w11)
+
+	// Convert from 16-bit to 8-bit
+	return color.RGBA{
+		R: uint8(r >> 8),
+		G: uint8(g >> 8),
+		B: uint8(b >> 8),
+		A: uint8(a >> 8),
+	}
+}
+
+// clampInt clamps an integer value to [min, max]
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// extractFilmStock extracts the film stock name from a roll folder name.
+// It returns only the first word after the roll prefix that contains letters,
+// ignoring subsequent numeric lab reference numbers.
+// Examples:
+//
+//	"Roll1 Colorplus200 35 08825" → "Colorplus200"
+//	"Roll2 Gold200 35 08826" → "Gold200"
+//	"Roll 3 - Portra400" → "Portra400"
+//	"MyRoll" → "" (no recognizable pattern)
+func extractFilmStock(rollName string) string {
+	// Try to find film stock after "Roll" prefix patterns
+	name := strings.TrimSpace(rollName)
+
+	// Pattern: "RollN <stock> [extra lab numbers...]"
+	// Remove leading "Roll" with optional number
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, "roll") {
+		rest := name[4:] // after "Roll"
+		// Skip optional number and separators
+		rest = strings.TrimLeft(rest, "0123456789")
+		rest = strings.TrimLeft(rest, " _-")
+		if rest != "" {
+			// Take only the first word (film stock name)
+			// Subsequent words are typically lab reference numbers
+			parts := strings.Fields(rest)
+			if len(parts) > 0 {
+				return parts[0]
+			}
+		}
+	}
+
+	// If no "Roll" prefix, return empty (the whole name might be the film stock)
+	// but we don't want to tag with just a folder name
+	return ""
+}
+
 
 // generatePP3 creates a PP3 profile for the given edit settings
 func (s *Server) generatePP3(img *ImageInfo, edit EditData, globalPreset string) (string, error) {

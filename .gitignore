@@ -45,3 +45,5 @@ Thumbs.db
 # Tone calibration tool outputs (intermediate files)
 calibration.db
 tone_formula - v*.json
+# Screenshots
+film-scan-*.png

@@ -15,6 +15,7 @@ import (
 	"github.com/ohavrylyuk/camera-to-immich/internal/config"
 	"github.com/ohavrylyuk/camera-to-immich/internal/drive"
 	"github.com/ohavrylyuk/camera-to-immich/internal/editor"
+	customexif "github.com/ohavrylyuk/camera-to-immich/internal/exif"
 	"github.com/ohavrylyuk/camera-to-immich/internal/processor"
 	"github.com/ohavrylyuk/camera-to-immich/internal/scanner"
 	"github.com/ohavrylyuk/camera-to-immich/internal/state"
@@ -48,6 +49,8 @@ func main() {
 	stateInfo := flag.Bool("state-info", false, "Show state file information and exit")
 	editorMode := flag.Bool("editor", false, "Launch web editor for image preview and adjustment")
 	editorPort := flag.String("editor-port", "8080", "Port for the web editor server")
+	filmMode := flag.Bool("film", false, "Film scan mode: enables date assignment, JPG processing, roll grouping")
+	sourcePath := flag.String("source", "", "Source folder path (for film scan mode, bypasses drive detection)")
 	retryUpload := flag.Bool("retry-upload", false, "Upload existing processed files from output directory without reprocessing")
 	noUploadUI := flag.Bool("no-upload-ui", false, "Suppress immich-go UI during upload (quiet mode)")
 	clearCache := flag.Bool("clear-cache", false, "Clear the preview image cache and exit")
@@ -93,7 +96,7 @@ func main() {
 
 	// Editor mode - early exit path that doesn't require full config validation
 	if *editorMode {
-		runEditor(*configPath, *driveLabel, *outputDir, *profilePath, *editorPort, *limit, *skipUpload)
+		runEditor(*configPath, *driveLabel, *outputDir, *profilePath, *editorPort, *limit, *skipUpload, *filmMode, *sourcePath)
 		os.Exit(0)
 	}
 
@@ -452,9 +455,21 @@ func run(cfg *config.Config, verbose bool) error {
 
 // runWithRAWProcessing handles the workflow when RAW processing is enabled
 func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
-	// Filter unprocessed RAW files using time-based high-water mark
+	// Filter unprocessed RAW files using EXIF capture time (authoritative).
+	// File mtime can be touched by OS/card readers/AV scans, so we always
+	// validate candidates against EXIF DateTimeOriginal to avoid re-uploading
+	// already-processed photos whose mtime was bumped.
 	lastProcessedTime := appState.GetLastProcessedTime()
-	newRAWFiles := scanner.FilterNewFilesWithTime(scanResult.RAWFiles, nil, lastProcessedTime)
+	preCount := len(scanResult.RAWFiles)
+	newRAWFiles := scanner.FilterNewFilesWithCaptureTime(
+		scanResult.RAWFiles,
+		lastProcessedTime,
+		customexif.GetDateTimeOriginalWithFallback,
+	)
+	if !lastProcessedTime.IsZero() && preCount != len(newRAWFiles) {
+		logInfo("Filtered %d already-processed RAW files (by EXIF capture time, high-water mark: %s)",
+			preCount-len(newRAWFiles), lastProcessedTime.Format("2006-01-02 15:04:05"))
+	}
 
 	if len(newRAWFiles) == 0 {
 		logSuccess("No new RAW files to process!")
@@ -782,9 +797,14 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 			}
 		}
 
-		// Update high-water mark with file's actual modification time
-		fileModTime := time.Unix(result.rawFile.ModTime, 0)
-		appState.MarkProcessed(fileModTime)
+		// Update high-water mark using EXIF capture time (authoritative);
+		// FilterNewFilesWithCaptureTime already populated CaptureTime for
+		// surviving files. Falls back to ModTime if CaptureTime unavailable.
+		fileTime := time.Unix(result.rawFile.CaptureTime, 0)
+		if result.rawFile.CaptureTime == 0 {
+			fileTime = time.Unix(result.rawFile.ModTime, 0)
+		}
+		appState.MarkProcessed(fileTime)
 	}
 
 	// Log total processing time
@@ -917,9 +937,21 @@ func runWithRAWProcessing(cfg *config.Config, appState *state.State, scanResult 
 func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scanner.ScanResult, im *uploader.Immich, verbose bool) error {
 	logInfo("RAW processing disabled - uploading JPG files only")
 
-	// Filter unprocessed JPG files using time-based high-water mark
+	// Filter unprocessed JPG files using EXIF capture time (authoritative).
+	// File mtime can be touched by OS/card readers/AV scans, so we always
+	// validate candidates against EXIF DateTimeOriginal to avoid re-uploading
+	// already-processed photos whose mtime was bumped.
 	lastProcessedTime := appState.GetLastProcessedTime()
-	newJPGFiles := scanner.FilterNewFilesWithTime(scanResult.JPGFiles, nil, lastProcessedTime)
+	preCount := len(scanResult.JPGFiles)
+	newJPGFiles := scanner.FilterNewFilesWithCaptureTime(
+		scanResult.JPGFiles,
+		lastProcessedTime,
+		customexif.GetDateTimeOriginalWithFallback,
+	)
+	if !lastProcessedTime.IsZero() && preCount != len(newJPGFiles) {
+		logInfo("Filtered %d already-processed JPG files (by EXIF capture time, high-water mark: %s)",
+			preCount-len(newJPGFiles), lastProcessedTime.Format("2006-01-02 15:04:05"))
+	}
 
 	if len(newJPGFiles) == 0 {
 		logSuccess("No new JPG files to upload!")
@@ -957,12 +989,25 @@ func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scann
 			logSuccess("Uploaded: %s", jpgFile.Name)
 		}
 
-		// Update high-water mark with file's actual modification time
-		fileModTime := time.Unix(jpgFile.ModTime, 0)
-		appState.MarkProcessed(fileModTime)
+		// Update high-water mark using EXIF capture time (authoritative);
+		// FilterNewFilesWithCaptureTime already populated CaptureTime for
+		// surviving files. Falls back to ModTime if CaptureTime unavailable.
+		fileTime := time.Unix(jpgFile.CaptureTime, 0)
+		if jpgFile.CaptureTime == 0 {
+			fileTime = time.Unix(jpgFile.ModTime, 0)
+		}
+		appState.MarkProcessed(fileTime)
+
+		// Save state incrementally so that if the upload is interrupted,
+		// already-uploaded files are not re-uploaded on the next run.
+		// (UploadFile spawns immich-go per file, so this is slow already —
+		// the small extra cost of a state write per file is negligible.)
+		if err := appState.Save(); err != nil {
+			logError("Failed to save state after %s: %v", jpgFile.Name, err)
+		}
 	}
 
-	// Save state
+	// Final state save (in case the loop body's incremental save was skipped)
 	if err := appState.Save(); err != nil {
 		return fmt.Errorf("failed to save state: %v", err)
 	}
@@ -1141,9 +1186,14 @@ func getProfileTag(profilePath string) string {
 }
 
 // runEditor launches the web-based image editor
-func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limit int, skipUpload bool) {
-	fmt.Println("🖼  Camera-to-Immich Web Editor")
-	fmt.Println("================================")
+func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limit int, skipUpload bool, filmMode bool, sourcePath string) {
+	if filmMode {
+		fmt.Println("🎞️  Camera-to-Immich Film Scan Editor")
+		fmt.Println("======================================")
+	} else {
+		fmt.Println("🖼  Camera-to-Immich Web Editor")
+		fmt.Println("================================")
+	}
 
 	// Load config for defaults
 	cfgPath := configPath
@@ -1175,18 +1225,48 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 		cfg.SkipUpload = true
 	}
 
-	// Check required external tools
-	if err := checkRequiredTools(cfg); err != nil {
-		log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+	// Determine source path
+	var imageSourcePath string
+
+	if filmMode && sourcePath != "" {
+		// Film scan mode with explicit source path — bypass drive detection
+		// Validate source path exists
+		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+			log.Fatalf("Source path does not exist: %s", sourcePath)
+		}
+		imageSourcePath = sourcePath
+		fmt.Printf("✓ Using source folder: %s\n", imageSourcePath)
+	} else if sourcePath != "" {
+		// Source path provided without film mode — use it directly
+		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+			log.Fatalf("Source path does not exist: %s", sourcePath)
+		}
+		imageSourcePath = sourcePath
+		fmt.Printf("✓ Using source folder: %s\n", imageSourcePath)
+	} else {
+		// Standard mode — find camera drive
+		// Check required external tools (only for standard mode, film mode doesn't need RawTherapee)
+		if !filmMode {
+			if err := checkRequiredTools(cfg); err != nil {
+				log.Fatalf("Missing tools: %v\nSee README.md for installation instructions.", err)
+			}
+		}
+
+		fmt.Printf("Searching for drive '%s'...\n", cfg.DriveLabel)
+		driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
+		if err != nil {
+			log.Fatalf("Camera drive not found: %v\nUse --drive to specify a different drive label, or --list-drives to see available drives", err)
+		}
+		fmt.Printf("✓ Found drive at: %s\n", driveInfo.Path)
+		imageSourcePath = driveInfo.Path
 	}
 
-	// Find camera drive
-	fmt.Printf("Searching for drive '%s'...\n", cfg.DriveLabel)
-	driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
-	if err != nil {
-		log.Fatalf("Camera drive not found: %v\nUse --drive to specify a different drive label, or --list-drives to see available drives", err)
+	// In film mode, only check for exiftool (needed for date stamping)
+	if filmMode {
+		if _, err := exec.LookPath("exiftool"); err != nil {
+			log.Fatalf("exiftool is required for film scan mode.\nDownload from https://exiftool.org/")
+		}
 	}
-	fmt.Printf("✓ Found drive at: %s\n", driveInfo.Path)
 
 	// Ensure output directory
 	if cfg.OutputDirectory == "" {
@@ -1204,19 +1284,20 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 
 	// Create editor server
 	serverConfig := editor.ServerConfig{
-		SourcePath:    driveInfo.Path,
+		SourcePath:    imageSourcePath,
 		OutputDir:     cfg.OutputDirectory,
 		ProfilePath:   cfg.PP3ProfilePath,
 		BWProfilePath: cfg.PP3BWProfilePath,
 		RawExtensions: cfg.GetRawExtensionsMap(),
 		EditsPath:     filepath.Join(cfg.OutputDirectory, "edits.json"),
 		Limit:         limit,
+		FilmScanMode:  filmMode,
 		ProcessConfig: editor.ProcessConfig{
 			ConvertToDNG:       cfg.ConvertToDNG,
 			DNGConverterPath:   cfg.DNGConverterPath,
 			RawTherapeeExe:     cfg.RawTherapeeExecutable,
 			JPEGQuality:        cfg.JPEGQuality,
-			SkipUpload:         skipUpload,
+			SkipUpload:         skipUpload || cfg.SkipUpload,
 			Workers:            cfg.Workers,
 			UploadCameraJPGs:   cfg.UploadCameraJPGs,
 			PP3BWProfilePath:   cfg.PP3BWProfilePath,
@@ -1226,10 +1307,12 @@ func runEditor(configPath, driveLabel, outputDir, profilePath, port string, limi
 			ImmichAPIKey:       cfg.ImmichAPIKey,
 			ImmichAlbum:        cfg.ImmichAlbum,
 			ImmichTags:         cfg.ImmichTags,
+			FilmScanTags:       cfg.FilmScanTags,
 			TagWithProfileName: cfg.TagWithProfileName,
 			NoUploadUI:         cfg.NoUploadUI,
 			CleanupAfterUpload: cfg.CleanupAfterUpload,
 			StatePath:          statePath,
+			FilmScanMode:       filmMode,
 		},
 	}
 

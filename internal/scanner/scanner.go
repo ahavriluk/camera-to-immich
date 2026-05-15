@@ -161,6 +161,54 @@ func FilterNewFilesWithTime(files []FileInfo, processedFiles map[string]bool, la
 	return newFiles
 }
 
+// FilterNewFilesWithCaptureTime performs two-stage filtering against a high-water mark:
+//
+//  1. Pre-filter by file ModTime (cheap, no I/O beyond what's already loaded).
+//  2. For surviving candidates, load the EXIF DateTimeOriginal via getCaptureTime
+//     and do a final filter using the EXIF capture time.
+//
+// This is the AUTHORITATIVE filter — file mtime can be touched by the OS, card
+// readers, antivirus, etc., causing already-uploaded photos to incorrectly appear
+// "new" if filtered by mtime alone. EXIF DateTimeOriginal reflects the actual
+// shutter time and is immutable.
+//
+// On return, surviving files have CaptureTime populated (Unix seconds).
+//
+// getCaptureTime should return a fallback (e.g. file mtime) if EXIF is unreadable;
+// the helper exif.GetDateTimeOriginalWithFallback satisfies this contract.
+//
+// If lastProcessedTime is zero, all files are returned (CaptureTime still loaded
+// for surviving files so callers can advance the high-water mark with EXIF time).
+func FilterNewFilesWithCaptureTime(
+	files []FileInfo,
+	lastProcessedTime time.Time,
+	getCaptureTime func(string) time.Time,
+) []FileInfo {
+	result := make([]FileInfo, 0, len(files))
+	for i := range files {
+		f := files[i] // copy so we can mutate CaptureTime safely
+
+		// Stage 1: ModTime pre-filter (cheap)
+		if !lastProcessedTime.IsZero() {
+			fileModTime := time.Unix(f.ModTime, 0)
+			if !fileModTime.After(lastProcessedTime) {
+				continue
+			}
+		}
+
+		// Stage 2: EXIF capture time (authoritative)
+		captureTime := getCaptureTime(f.Path)
+		f.CaptureTime = captureTime.Unix()
+
+		if !lastProcessedTime.IsZero() && !captureTime.After(lastProcessedTime) {
+			continue
+		}
+
+		result = append(result, f)
+	}
+	return result
+}
+
 // GetCaptureTime returns the capture time as a time.Time
 // If CaptureTime is 0 (not loaded), returns ModTime as fallback
 func (f *FileInfo) GetCaptureTime() time.Time {
