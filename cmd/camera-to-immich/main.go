@@ -968,51 +968,73 @@ func runJPGOnlyMode(cfg *config.Config, appState *state.State, scanResult *scann
 		return nil
 	}
 
-	// Upload JPG files
-	logStep("Uploading %d JPG files to Immich...", len(newJPGFiles))
+	// Upload JPG files in a single batch.
+	//
+	// Previously this loop called im.UploadFile() per file, which spawns
+	// immich-go once per file. immich-go has ~2-5s of fixed overhead per
+	// invocation (process startup, TLS handshake, auth, album lookup), so
+	// uploading N files took O(N) * overhead — minutes for a normal card.
+	//
+	// Now we stage all new JPGs into one temp directory and call
+	// im.UploadFolder() once, matching the fast path used by the RAW
+	// processing workflow. immich-go does server-side deduplication by
+	// content hash, so if a batch is interrupted and retried the already-
+	// uploaded assets are skipped cheaply on the next run.
+	logStep("Uploading %d JPG files to Immich (batch upload)...", len(newJPGFiles))
 
 	tags := []string{"camera-original"}
-	uploadedCount := 0
 
-	for i, jpgFile := range newJPGFiles {
-		if verbose {
-			logStep("[%d/%d] Uploading %s...", i+1, len(newJPGFiles), jpgFile.Name)
-		}
+	tempDir, err := os.MkdirTemp("", "jpg-only-upload-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp directory for JPG upload: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
 
-		if err := im.UploadFile(jpgFile.Path, tags); err != nil {
-			logError("Failed to upload %s: %v", jpgFile.Name, err)
+	// Stage all JPGs into the temp directory.
+	copyStart := time.Now()
+	stagedFiles := make([]scanner.FileInfo, 0, len(newJPGFiles))
+	var latestTime time.Time
+	for _, jpgFile := range newJPGFiles {
+		destPath := filepath.Join(tempDir, jpgFile.Name)
+		if err := copyFileSimple(jpgFile.Path, destPath); err != nil {
+			logError("Failed to stage %s: %v", jpgFile.Name, err)
 			continue
 		}
+		stagedFiles = append(stagedFiles, jpgFile)
 
-		uploadedCount++
-		if verbose {
-			logSuccess("Uploaded: %s", jpgFile.Name)
-		}
-
-		// Update high-water mark using EXIF capture time (authoritative);
-		// FilterNewFilesWithCaptureTime already populated CaptureTime for
-		// surviving files. Falls back to ModTime if CaptureTime unavailable.
+		// Track latest capture time (EXIF preferred, mtime fallback) so we
+		// can update the high-water mark after a successful batch upload.
 		fileTime := time.Unix(jpgFile.CaptureTime, 0)
 		if jpgFile.CaptureTime == 0 {
 			fileTime = time.Unix(jpgFile.ModTime, 0)
 		}
-		appState.MarkProcessed(fileTime)
-
-		// Save state incrementally so that if the upload is interrupted,
-		// already-uploaded files are not re-uploaded on the next run.
-		// (UploadFile spawns immich-go per file, so this is slow already —
-		// the small extra cost of a state write per file is negligible.)
-		if err := appState.Save(); err != nil {
-			logError("Failed to save state after %s: %v", jpgFile.Name, err)
+		if fileTime.After(latestTime) {
+			latestTime = fileTime
 		}
 	}
+	logTiming("Stage JPG files to temp", copyStart)
 
-	// Final state save (in case the loop body's incremental save was skipped)
+	if len(stagedFiles) == 0 {
+		return fmt.Errorf("no JPG files could be staged for upload")
+	}
+
+	// Upload the staged directory in a single immich-go invocation.
+	uploadStart := time.Now()
+	if err := im.UploadFolder(tempDir, tags, false); err != nil {
+		return fmt.Errorf("failed to upload JPG files: %v", err)
+	}
+	uploadElapsed := time.Since(uploadStart)
+	logSuccess("Uploaded %d JPG files (%.1fs)", len(stagedFiles), uploadElapsed.Seconds())
+
+	// Advance the high-water mark only after the batch succeeded.
+	if !latestTime.IsZero() {
+		appState.MarkProcessed(latestTime)
+	}
 	if err := appState.Save(); err != nil {
 		return fmt.Errorf("failed to save state: %v", err)
 	}
 
-	logSuccess("Done! Uploaded %d JPG files.", uploadedCount)
+	logSuccess("Done! Uploaded %d JPG files.", len(stagedFiles))
 
 	return nil
 }
