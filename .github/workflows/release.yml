@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+            archive: zip
+          - goos: linux
+            goarch: amd64
+            ext: ''
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -o "dist/camera-to-immich${{ matrix.ext }}" ./cmd/camera-to-immich
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -o "dist/chroma-denoise${{ matrix.ext }}" ./cmd/chroma-denoise
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+            -o "dist/chroma-measure${{ matrix.ext }}" ./cmd/chroma-measure
+
+      - name: Package (zip - Windows)
+        if: matrix.archive == 'zip'
+        run: |
+          cd dist
+          zip -9 "camera-to-immich-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip" \
+            "camera-to-immich${{ matrix.ext }}" \
+            "chroma-denoise${{ matrix.ext }}" \
+            "chroma-measure${{ matrix.ext }}"
+
+      - name: Package (tar.gz - Linux/macOS)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd dist
+          tar -czf "camera-to-immich-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
+            "camera-to-immich${{ matrix.ext }}" \
+            "chroma-denoise${{ matrix.ext }}" \
+            "chroma-measure${{ matrix.ext }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/camera-to-immich-*.${{ matrix.archive }}
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
