@@ -12,6 +12,7 @@ import (
 type Config struct {
 	// Drive settings
 	DriveLabel string `json:"drive_label"` // Volume label to search for (default: "OM SYSTEM")
+	SourcePath string `json:"source_path"` // Optional explicit source folder; if set, bypasses drive detection
 
 	// File settings
 	RawExtensions []string `json:"raw_extensions"` // RAW file extensions to process (e.g., [".ORF", ".CR2", ".NEF", ".ARW"])
