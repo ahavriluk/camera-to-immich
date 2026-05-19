@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	version = "2.3.1"
+	version = "2.3.2"
 )
 
 func main() {
@@ -62,6 +62,16 @@ func main() {
 	if *showVersion {
 		fmt.Printf("camera-to-immich version %s\n", version)
 		os.Exit(0)
+	}
+
+	// -film implies -editor: film-scan business logic (date stamping, roll
+	// grouping, per-frame review) currently lives entirely in the editor
+	// server. Running -film without -editor would silently skip all of it,
+	// which previously caused confusion. Auto-enable -editor and inform the
+	// user.
+	if *filmMode && !*editorMode {
+		fmt.Println("ℹ --film implies --editor; enabling editor mode automatically.")
+		*editorMode = true
 	}
 
 	// List drives mode
@@ -171,6 +181,12 @@ func main() {
 	}
 	if *noUploadUI {
 		cfg.NoUploadUI = true
+	}
+	if *sourcePath != "" {
+		if _, err := os.Stat(*sourcePath); os.IsNotExist(err) {
+			log.Fatalf("Source path does not exist: %s", *sourcePath)
+		}
+		cfg.SourcePath = *sourcePath
 	}
 
 	// Validate configuration
@@ -371,17 +387,31 @@ func clearCacheFiles(configPath, outputDirOverride string) {
 func run(cfg *config.Config, verbose bool) error {
 	totalStart := time.Now()
 
-	// Step 1: Find the camera drive
-	logStep("Searching for drive '%s'...", cfg.DriveLabel)
-	driveStart := time.Now()
+	// Step 1: Determine the source folder.
+	// If an explicit source path was provided (via --source flag or config),
+	// use it directly and bypass drive detection. Otherwise, locate the
+	// camera drive by volume label.
+	var sourceDir string
+	if cfg.SourcePath != "" {
+		logStep("Using source folder: %s", cfg.SourcePath)
+		if _, err := os.Stat(cfg.SourcePath); os.IsNotExist(err) {
+			return fmt.Errorf("source path does not exist: %s", cfg.SourcePath)
+		}
+		sourceDir = cfg.SourcePath
+		logSuccess("Source folder ready")
+	} else {
+		logStep("Searching for drive '%s'...", cfg.DriveLabel)
+		driveStart := time.Now()
 
-	driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
-	if err != nil {
-		return fmt.Errorf("camera drive not found: %v", err)
+		driveInfo, err := drive.FindDriveByLabel(cfg.DriveLabel)
+		if err != nil {
+			return fmt.Errorf("camera drive not found: %v", err)
+		}
+
+		sourceDir = driveInfo.Path
+		logSuccess("Found drive at: %s", driveInfo.Path)
+		logTiming("Drive detection", driveStart)
 	}
-
-	logSuccess("Found drive at: %s", driveInfo.Path)
-	logTiming("Drive detection", driveStart)
 
 	// Step 2: Load state
 	statePath, err := state.DefaultStatePath()
@@ -406,7 +436,7 @@ func run(cfg *config.Config, verbose bool) error {
 	logStep("Scanning for RAW files (%v) and JPG files...", cfg.RawExtensions)
 	scanStart := time.Now()
 
-	scanResult, err := scanner.ScanForImages(driveInfo.Path, rawExtensions)
+	scanResult, err := scanner.ScanForImages(sourceDir, rawExtensions)
 	if err != nil {
 		return fmt.Errorf("failed to scan drive: %v", err)
 	}
