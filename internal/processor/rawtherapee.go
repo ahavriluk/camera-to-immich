@@ -119,6 +119,50 @@ func (rt *RawTherapee) ProcessFileWithProfile(inputPath string, profilePath stri
 	return outputPath, nil
 }
 
+// ProcessFileStacked processes a single RAW file with multiple stacked PP3 profiles.
+// Later profiles in the slice override settings from earlier ones (RawTherapee
+// semantics for repeated -p flags).
+func (rt *RawTherapee) ProcessFileStacked(inputPath string, profilePaths []string) (string, error) {
+	baseName := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+	outputPath := filepath.Join(rt.config.OutputDir, baseName+".jpg")
+
+	args := []string{
+		"-o", outputPath,
+		"-j" + fmt.Sprintf("%d", rt.config.Quality),
+		"-Y",
+	}
+	for _, p := range profilePaths {
+		if p == "" {
+			continue
+		}
+		args = append(args, "-p", p)
+	}
+	args = append(args, "-c", inputPath)
+
+	timeout := rt.config.Timeout
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, rt.config.ExecutablePath, args...)
+	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("rawtherapee-cli timed out after %v", timeout)
+	}
+	if err != nil {
+		return "", fmt.Errorf("rawtherapee-cli failed: %v\nOutput: %s", err, string(output))
+	}
+
+	if _, err := os.Stat(outputPath); os.IsNotExist(err) {
+		return "", fmt.Errorf("output file was not created: %s", outputPath)
+	}
+
+	return outputPath, nil
+}
+
 // GetPerImageProfilePath returns the path to a per-image PP3 profile if it exists
 // Returns empty string if no per-image profile exists
 func (rt *RawTherapee) GetPerImageProfilePath(imagePath string) string {
