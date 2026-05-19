@@ -6,57 +6,40 @@ $ErrorActionPreference = "Stop"
 $projectName = "camera-to-immich"
 $outputDir = ".\build"
 
+# All cmd/ binaries to build. Add new entries here as new tools are added.
+$binaries = @(
+    @{ Name = "camera-to-immich"; Path = ".\cmd\camera-to-immich" },
+    @{ Name = "chroma-denoise";   Path = ".\cmd\chroma-denoise"   }
+)
+
+# Target platforms (GOOS, GOARCH, output suffix, extension).
+$targets = @(
+    @{ GOOS = "windows"; GOARCH = "amd64"; Suffix = "windows-amd64"; Ext = ".exe" },
+    @{ GOOS = "darwin";  GOARCH = "amd64"; Suffix = "darwin-amd64";  Ext = ""     },
+    @{ GOOS = "darwin";  GOARCH = "arm64"; Suffix = "darwin-arm64";  Ext = ""     },
+    @{ GOOS = "linux";   GOARCH = "amd64"; Suffix = "linux-amd64";   Ext = ""     }
+)
+
 # Create output directory
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 Write-Host "Building $projectName..." -ForegroundColor Cyan
 
-# Build for Windows (amd64)
-Write-Host "`nBuilding for Windows (amd64)..." -ForegroundColor Yellow
-$env:GOOS = "windows"
-$env:GOARCH = "amd64"
-go build -ldflags="-s -w" -o "$outputDir\$projectName-windows-amd64.exe" .\cmd\camera-to-immich
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ $outputDir\$projectName-windows-amd64.exe" -ForegroundColor Green
-} else {
-    Write-Host "  ✗ Build failed" -ForegroundColor Red
-    exit 1
-}
+foreach ($target in $targets) {
+    Write-Host "`nBuilding for $($target.GOOS)/$($target.GOARCH)..." -ForegroundColor Yellow
+    $env:GOOS = $target.GOOS
+    $env:GOARCH = $target.GOARCH
 
-# Build for macOS (Intel)
-Write-Host "`nBuilding for macOS (Intel)..." -ForegroundColor Yellow
-$env:GOOS = "darwin"
-$env:GOARCH = "amd64"
-go build -ldflags="-s -w" -o "$outputDir\$projectName-darwin-amd64" .\cmd\camera-to-immich
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ $outputDir\$projectName-darwin-amd64" -ForegroundColor Green
-} else {
-    Write-Host "  ✗ Build failed" -ForegroundColor Red
-    exit 1
-}
-
-# Build for macOS (Apple Silicon)
-Write-Host "`nBuilding for macOS (Apple Silicon)..." -ForegroundColor Yellow
-$env:GOOS = "darwin"
-$env:GOARCH = "arm64"
-go build -ldflags="-s -w" -o "$outputDir\$projectName-darwin-arm64" .\cmd\camera-to-immich
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ $outputDir\$projectName-darwin-arm64" -ForegroundColor Green
-} else {
-    Write-Host "  ✗ Build failed" -ForegroundColor Red
-    exit 1
-}
-
-# Build for Linux (amd64)
-Write-Host "`nBuilding for Linux (amd64)..." -ForegroundColor Yellow
-$env:GOOS = "linux"
-$env:GOARCH = "amd64"
-go build -ldflags="-s -w" -o "$outputDir\$projectName-linux-amd64" .\cmd\camera-to-immich
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ $outputDir\$projectName-linux-amd64" -ForegroundColor Green
-} else {
-    Write-Host "  ✗ Build failed" -ForegroundColor Red
-    exit 1
+    foreach ($bin in $binaries) {
+        $outFile = "$outputDir\$($bin.Name)-$($target.Suffix)$($target.Ext)"
+        go build -ldflags="-s -w" -o $outFile $bin.Path
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  ✓ $outFile" -ForegroundColor Green
+        } else {
+            Write-Host "  ✗ Build failed for $($bin.Name)" -ForegroundColor Red
+            exit 1
+        }
+    }
 }
 
 # Reset to host environment
