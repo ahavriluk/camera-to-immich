@@ -47,6 +47,18 @@ if ($LASTEXITCODE -eq 0) {
     exit 1
 }
 
+# Build for Linux (amd64)
+Write-Host "`nBuilding for Linux (amd64)..." -ForegroundColor Yellow
+$env:GOOS = "linux"
+$env:GOARCH = "amd64"
+go build -ldflags="-s -w" -o "$outputDir\$projectName-linux-amd64" .\cmd\camera-to-immich
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  ✓ $outputDir\$projectName-linux-amd64" -ForegroundColor Green
+} else {
+    Write-Host "  ✗ Build failed" -ForegroundColor Red
+    exit 1
+}
+
 # Reset to host environment
 $env:GOOS = ""
 $env:GOARCH = ""
