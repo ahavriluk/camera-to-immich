@@ -47,3 +47,6 @@ calibration.db
 tone_formula - v*.json
 # Screenshots
 film-scan-*.png
+
+# Local test data (large JPGs not suitable for repo)
+testdata/

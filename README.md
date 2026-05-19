@@ -401,6 +401,88 @@ Scale=85
 3. Enable Film Grain
 4. Enter the suggested ISO, Strength, and Scale values
 5. Save as a PP3 profile for reuse
+### Chroma Denoiser (Optional Tool)
+
+The chroma denoiser is a standalone utility that removes **chrominance noise** (the red/green/blue color blotches you see in shadows and flat areas at high ISO) from JPEG files. It leaves luminance ("brightness") detail completely untouched, so sharpness and texture are preserved.
+
+**Algorithm:**
+
+This is **not** a Gaussian blur on color channels — that approach causes color bleeding across edges. Instead, the tool implements an **edge-preserving Guided Filter** (He, Sun & Tang, *Guided Image Filtering*, TPAMI 2013) applied to the Cb and Cr chroma channels of the YCbCr-decoded JPEG, using the luminance (Y) channel as the edge guide. This means color smoothing aligns with luma edges and never bleeds across boundaries the human eye perceives as sharp.
+
+Pipeline:
+1. Decode the JPEG to its native YCbCr representation (no RGB conversion overhead).
+2. Apply a 3×3 median pre-pass on Cb/Cr to kill isolated "color speckle" pixels.
+3. Run the Guided Filter on each chroma channel, with Y downsampled to chroma resolution as the guide.
+4. Blend with the original chroma channels by a configurable strength factor.
+5. Re-encode the JPEG. EXIF metadata is preserved via APP1-segment splicing.
+
+For 4:2:0 JPEGs (the common case for camera output), the chroma planes are a quarter the size of the image, so the filter runs ~6× faster than approaches that operate on full-resolution RGB.
+
+**Build the tool:**
+
+```bash
+go build -o chroma-denoise.exe ./cmd/chroma-denoise  # Windows
+go build -o chroma-denoise ./cmd/chroma-denoise       # macOS/Linux
+```
+
+**Usage:**
+
+```bash
+# Single file
+chroma-denoise -in photo.jpg -out photo_dn.jpg
+
+# Whole directory (recursive)
+chroma-denoise -in "C:\photos\highISO" -out "C:\photos\highISO_dn" -recursive
+
+# Auto-tune strength based on EXIF ISO speed
+chroma-denoise -in photo.jpg -out photo_dn.jpg -auto-iso
+
+# Manually tune (more aggressive smoothing)
+chroma-denoise -in photo.jpg -out photo_dn.jpg -radius 12 -epsilon 0.03
+
+# Partial strength (50% blend with original)
+chroma-denoise -in photo.jpg -out photo_dn.jpg -strength 0.5
+
+# Process in place (writes "_dn" suffix to avoid overwriting)
+chroma-denoise -in "C:\photos" -out "C:\photos" -suffix _dn
+```
+
+**Command-line Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-in` | Input JPEG file or directory | Required |
+| `-out` | Output JPEG file or directory | Required |
+| `-recursive` | Recurse into subdirectories when `-in` is a directory | `false` |
+| `-radius` | Guided-filter half-radius in chroma pixels (typical 4..16) | `8` |
+| `-epsilon` | Smoothing strength (typical 0.001..0.05). Higher = more smoothing. | `0.01` |
+| `-strength` | Blend factor in [0..1]. 0 = no change, 1 = fully denoised | `1.0` |
+| `-median` | Apply 3×3 median pre-pass on chroma (kills color speckle) | `true` |
+| `-quality` | Output JPEG quality (1..100) | `92` |
+| `-exif` | Preserve EXIF metadata from source | `true` |
+| `-auto-iso` | Scale `-radius` and `-epsilon` based on EXIF ISO speed | `false` |
+| `-workers` | Parallel file workers (0 = NumCPU/2, capped at 4) | `0` |
+| `-suffix` | Suffix appended to filenames when input dir == output dir | `_dn` |
+| `-dry-run` | List files that would be processed; don't actually denoise | `false` |
+| `-verbose` | Verbose per-file output | `false` |
+
+**Tuning guide:**
+
+| ISO range | Recommended `-radius` | Recommended `-epsilon` |
+|-----------|----------------------|------------------------|
+| 100..400 (clean) | 4 | 0.005 |
+| 800..1600 (mild noise) | 6..8 | 0.01..0.015 |
+| 3200..6400 (visible noise) | 8..12 | 0.02..0.03 |
+| 12800+ (heavy noise) | 12..16 | 0.03..0.05 |
+
+When in doubt, use `-auto-iso` and let the tool pick reasonable values from the EXIF data.
+
+**What it does NOT do:**
+
+- It does NOT touch luminance noise (the brightness speckle that looks like film grain). Chroma noise is the unsightly part; luma "noise" is usually aesthetically pleasing or neutral and is what dedicated denoisers like Topaz/DxO target with separate luma controls.
+- It does NOT process RAW files. Use RawTherapee for those (see the main `camera-to-immich` workflow).
+- It does NOT use AI/ML — it's a classical algorithm. Output is deterministic and runs entirely on CPU with no model files or GPU required.
+
 
 ## Usage
 
